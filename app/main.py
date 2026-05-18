@@ -149,6 +149,46 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "metadata)."
         ),
     )
+    parser.add_argument(
+        "--train-csv",
+        type=str,
+        default=None,
+        help=(
+            "Path to an OHLCV CSV with columns "
+            "(timestamp, open, high, low, close, volume). Required for "
+            "MODE=TRAIN."
+        ),
+    )
+    parser.add_argument(
+        "--model-kind",
+        choices=["logreg", "lightgbm"],
+        default="logreg",
+        help="Trainer to use for MODE=TRAIN (default: logreg).",
+    )
+    parser.add_argument(
+        "--train-frac",
+        type=float,
+        default=0.70,
+        help="Chronological train fraction for MODE=TRAIN (default 0.70).",
+    )
+    parser.add_argument(
+        "--val-frac",
+        type=float,
+        default=0.15,
+        help=(
+            "Chronological val fraction for MODE=TRAIN (default 0.15). "
+            "Test fraction = 1 - train_frac - val_frac."
+        ),
+    )
+    parser.add_argument(
+        "--max-hold-bars",
+        type=int,
+        default=None,
+        help=(
+            "Override settings.MAX_HOLD_BARS for the TP/SL labeler in "
+            "MODE=TRAIN (default: settings.MAX_HOLD_BARS, or 20)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1102,6 +1142,413 @@ def _run_retrain_from_feedback(settings: Settings, log, *, args=None) -> int:
     return 0
 
 
+def _run_train_from_csv(settings: Settings, log, args) -> int:
+    """Train a model on a real OHLCV CSV and save it to the registry.
+
+    Pipeline (mirrors ``--smoke-train`` but on real data):
+
+    1. Load + validate the CSV (timestamp, open, high, low, close,
+       volume) via ``data.csv_loader.load_ohlcv_csv``.
+    2. Build canonical features.
+    3. Detect setups using ``VWAPEMAPullback``.
+    4. Label setups with TP/SL/time using ``label_setups`` and
+       ``--max-hold-bars`` (default: ``settings.MAX_HOLD_BARS``).
+    5. Build X (FEATURE_COLUMNS) + y (0/1) from the setup feature
+       snapshots, sorted chronologically by timestamp.
+    6. Chronological 3-way split (train / val / test). Never random.
+    7. Train via ``models.trainer.train`` with walk-forward CV over
+       (train + val); calibrate on val.
+    8. Save via ``models.model_registry.save_model`` with rich
+       ``extra_metadata`` (CSV path, strategy, split ranges, label
+       distribution, model_kind, train/val/test sizes).
+
+    Refuses to run on missing CSV (exit 7), too few rows (exit 4),
+    fewer than 100 setups (exit 4), single-class labels (exit 4), or
+    missing required feature columns (exit 4). LIVE mode is not
+    affected — this runner only ever writes to the local model
+    registry.
+    """
+    import pandas as pd
+    from pathlib import Path
+
+    from data.csv_loader import REQUIRED_COLUMNS, load_ohlcv_csv
+    from features.feature_builder import FEATURE_COLUMNS, build_features
+    from labeling.tp_sl_labeler import label_setups
+    from models.model_registry import save_model
+    from models.trainer import has_lightgbm, train
+    from strategies.vwap_ema_pullback import VWAPEMAPullback
+    from validation.time_split import chronological_split
+    from validation.walk_forward import walk_forward_splits
+
+    MIN_SETUPS = 100
+    MIN_OHLCV_ROWS = 200  # below this no strategy can warm up its features
+
+    # ---- 0. Validate inputs ------------------------------------------------
+    if not args.train_csv:
+        log.error(
+            "train.missing_csv",
+            note="MODE=TRAIN requires --train-csv PATH (real OHLCV CSV).",
+        )
+        return 4
+    if not args.model_name:
+        log.error(
+            "train.missing_model_name",
+            note="MODE=TRAIN requires --model-name NAME for the registry.",
+        )
+        return 4
+
+    csv_path = Path(args.train_csv)
+    if not csv_path.is_file():
+        log.error("train.csv_missing", path=str(csv_path))
+        return 7
+
+    # Resolve max_hold_bars: CLI > settings > 20.
+    max_hold_bars = (
+        int(args.max_hold_bars)
+        if args.max_hold_bars is not None
+        else int(getattr(settings, "MAX_HOLD_BARS", 20) or 20)
+    )
+    if max_hold_bars <= 0:
+        log.error("train.bad_max_hold_bars", value=max_hold_bars)
+        return 4
+
+    train_frac = float(args.train_frac)
+    val_frac = float(args.val_frac)
+    if train_frac <= 0 or val_frac < 0 or train_frac + val_frac >= 1.0:
+        log.error(
+            "train.bad_split_fractions",
+            train_frac=train_frac,
+            val_frac=val_frac,
+            note="train_frac > 0, val_frac >= 0, train_frac + val_frac < 1.",
+        )
+        return 4
+
+    model_kind = args.model_kind
+    if model_kind == "lightgbm" and not has_lightgbm():
+        log.error(
+            "train.lightgbm_unavailable",
+            note=(
+                "LightGBM is not installed. Install it (pip install lightgbm) "
+                "or pass --model-kind logreg."
+            ),
+        )
+        return 4
+
+    # ---- 1. Load OHLCV -----------------------------------------------------
+    try:
+        df = load_ohlcv_csv(
+            csv_path,
+            instrument=settings.INSTRUMENT,
+            timeframe="1m",
+            tz=settings.TIMEZONE,
+        )
+    except ValueError as e:
+        # ``load_ohlcv_csv`` raises ValueError on missing required columns —
+        # surface that as a config error rather than a crash.
+        log.error(
+            "train.csv_invalid",
+            path=str(csv_path),
+            error=str(e),
+            required_columns=list(REQUIRED_COLUMNS),
+        )
+        return 4
+
+    if df.empty or len(df) < MIN_OHLCV_ROWS:
+        log.error(
+            "train.csv_too_small",
+            rows=int(len(df)),
+            required_minimum=MIN_OHLCV_ROWS,
+            note=(
+                "CSV has too few rows to compute features and detect setups. "
+                "At least ~200 bars are needed for the warmup windows."
+            ),
+        )
+        return 4
+
+    log.info(
+        "train.csv_loaded",
+        path=str(csv_path),
+        rows=int(len(df)),
+        first_ts=str(df.index.min()),
+        last_ts=str(df.index.max()),
+        instrument=settings.INSTRUMENT,
+    )
+
+    # ---- 2. Features -------------------------------------------------------
+    features = build_features(df, instrument=settings.INSTRUMENT, tz=settings.TIMEZONE)
+    missing_cols = [c for c in FEATURE_COLUMNS if c not in features.columns]
+    if missing_cols:
+        log.error(
+            "train.features_missing_columns",
+            missing=missing_cols,
+            note=(
+                "Feature builder did not produce all FEATURE_COLUMNS. This "
+                "usually means the CSV is too short for warmups; widen the "
+                "data range and retry."
+            ),
+        )
+        return 4
+
+    log.info(
+        "train.features_built",
+        rows=int(len(features)),
+        feature_columns=len(FEATURE_COLUMNS),
+        first_ts=str(features.index.min()) if len(features) else None,
+        last_ts=str(features.index.max()) if len(features) else None,
+    )
+
+    # ---- 3. Setups ---------------------------------------------------------
+    strategy = VWAPEMAPullback(instrument=settings.INSTRUMENT)
+    setups = strategy.detect_setups(features)
+    by_dir: dict[str, int] = {"long": 0, "short": 0}
+    for s in setups:
+        by_dir[s.direction] = by_dir.get(s.direction, 0) + 1
+
+    log.info(
+        "train.setups_detected",
+        strategy=strategy.name,
+        total=len(setups),
+        long=by_dir["long"],
+        short=by_dir["short"],
+    )
+    if len(setups) < MIN_SETUPS:
+        log.error(
+            "train.too_few_setups",
+            n=len(setups),
+            required=MIN_SETUPS,
+            note=(
+                "Strategy did not produce enough setups for a stable train. "
+                "Common causes: CSV too short, warmup consuming most bars, "
+                "wrong instrument/timezone, or strategy params too strict."
+            ),
+        )
+        return 4
+
+    # ---- 4. Labels ---------------------------------------------------------
+    labels = label_setups(setups, df, max_hold_bars=max_hold_bars)
+    n_pos = sum(int(l.label) for l in labels)
+    log.info(
+        "train.labels_built",
+        n=len(labels),
+        positive=n_pos,
+        positive_rate=round(n_pos / len(labels), 4) if labels else 0.0,
+        max_hold_bars=max_hold_bars,
+    )
+    if n_pos == 0 or n_pos == len(labels):
+        log.error(
+            "train.single_class_labels",
+            positive=n_pos,
+            n=len(labels),
+            note=(
+                "All setups have the same label — cannot train a binary "
+                "classifier. Check TP/SL parameters and CSV coverage; both "
+                "wins and losses must occur."
+            ),
+        )
+        return 4
+
+    # ---- 5. Build X / y ----------------------------------------------------
+    rows = []
+    for setup, lab in zip(setups, labels):
+        row = dict(setup.features)
+        row["_label"] = int(lab.label)
+        row["_ts"] = setup.timestamp
+        rows.append(row)
+
+    setup_df = pd.DataFrame(rows).set_index("_ts")
+    setup_df.index = pd.DatetimeIndex(setup_df.index)
+    if not setup_df.index.is_monotonic_increasing:
+        setup_df = setup_df.sort_index()
+
+    feature_missing = [c for c in FEATURE_COLUMNS if c not in setup_df.columns]
+    if feature_missing:
+        log.error(
+            "train.setup_features_missing",
+            missing=feature_missing,
+            note="Setup feature snapshot is incomplete; cannot align to FEATURE_COLUMNS.",
+        )
+        return 4
+
+    y = setup_df["_label"].astype(int)
+    X = setup_df[list(FEATURE_COLUMNS)]
+
+    if y.nunique() < 2:
+        # Defense in depth: even after the earlier check, the chronological
+        # split below could still leave a single class in train/val. We
+        # check again and surface a clear error.
+        log.error("train.single_class_labels", positive=int(y.sum()), n=int(len(y)))
+        return 4
+
+    # ---- 6. Chronological split (never random) -----------------------------
+    try:
+        train_idx, val_idx, test_idx = chronological_split(
+            setup_df, train_frac=train_frac, val_frac=val_frac
+        )
+    except ValueError as e:
+        log.error(
+            "train.split_failed",
+            error=str(e),
+            n_setups=int(len(setup_df)),
+            train_frac=train_frac,
+            val_frac=val_frac,
+        )
+        return 4
+
+    X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
+    X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
+    X_test, y_test = X.iloc[test_idx], y.iloc[test_idx]
+
+    if y_train.nunique() < 2 or y_val.nunique() < 2:
+        log.error(
+            "train.single_class_in_fold",
+            train_classes=int(y_train.nunique()),
+            val_classes=int(y_val.nunique()),
+            note=(
+                "After chronological split, train or val contains a single "
+                "class. Provide a longer CSV or rebalance the split fractions."
+            ),
+        )
+        return 4
+
+    log.info(
+        "train.split",
+        n_total=int(len(setup_df)),
+        n_train=int(len(train_idx)),
+        n_val=int(len(val_idx)),
+        n_test=int(len(test_idx)),
+        train_start=str(X_train.index[0]),
+        train_end=str(X_train.index[-1]),
+        val_start=str(X_val.index[0]),
+        val_end=str(X_val.index[-1]),
+        test_start=str(X_test.index[0]),
+        test_end=str(X_test.index[-1]),
+        train_frac=train_frac,
+        val_frac=val_frac,
+    )
+
+    # ---- 7. Walk-forward over (train + val) --------------------------------
+    n_combined = len(train_idx) + len(val_idx)
+    test_bars = max(20, n_combined // 10)
+    train_min = max(50, n_combined - 5 * test_bars)
+    purge_bars = max(2, max_hold_bars)
+    embargo_bars = max(2, min(max_hold_bars // 4, test_bars - 1))
+    wf_splits: list = []
+    try:
+        wf_splits = list(
+            walk_forward_splits(
+                X.iloc[:n_combined],
+                n_folds=3,
+                train_min_bars=train_min,
+                test_bars=test_bars,
+                purge_bars=purge_bars,
+                embargo_bars=embargo_bars,
+            )
+        )
+    except ValueError as e:
+        log.warning("train.walk_forward_skipped", error=str(e))
+
+    # ---- 8. Train ----------------------------------------------------------
+    try:
+        result = train(
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            model_kind=model_kind,
+            walk_forward_cv=wf_splits,
+            features_full_df=X,
+            feature_names=list(FEATURE_COLUMNS),
+        )
+    except Exception as e:  # noqa: BLE001 - surface trainer failure cleanly
+        log.error("train.failed", model_kind=model_kind, error=str(e))
+        return 5
+
+    log.info(
+        "train.metrics_val",
+        model_kind=model_kind,
+        n_train=result.n_train,
+        n_val=result.n_val,
+        n_folds=len(result.fold_metrics),
+        **{
+            k: round(v, 4) if isinstance(v, float) else v
+            for k, v in result.aggregate_metrics.items()
+        },
+    )
+
+    # Holdout test metrics — independent confirmation that the calibrated
+    # model didn't simply memorize the val window.
+    test_proba = result.estimator.predict_proba(X_test)[:, 1]
+    test_pred = (test_proba >= float(settings.CONFIDENCE_THRESHOLD)).astype(int)
+    test_acc = float((test_pred == y_test.values).mean())
+    test_metrics = {
+        "n_test": int(len(test_idx)),
+        "accuracy": round(test_acc, 4),
+        "positive_rate": round(float(y_test.mean()), 4),
+        "approve_rate": round(float(test_pred.mean()), 4),
+    }
+    log.info("train.metrics_test", **test_metrics)
+
+    # ---- 9. Persist --------------------------------------------------------
+    extra_metadata = {
+        "source": "train_from_csv",
+        "csv_path": str(csv_path),
+        "instrument": settings.INSTRUMENT,
+        "timeframe": "1m",
+        "strategy": strategy.name,
+        "model_kind": model_kind,
+        "max_hold_bars": max_hold_bars,
+        "confidence_threshold": float(settings.CONFIDENCE_THRESHOLD),
+        "train_frac": train_frac,
+        "val_frac": val_frac,
+        "n_total_setups": int(len(setup_df)),
+        "n_train": int(len(train_idx)),
+        "n_val": int(len(val_idx)),
+        "n_test": int(len(test_idx)),
+        "label_distribution": {
+            "positive": int(n_pos),
+            "negative": int(len(labels) - n_pos),
+            "positive_rate": float(n_pos / len(labels)),
+        },
+        "ohlcv_range": {
+            "first_ts": str(df.index.min()),
+            "last_ts": str(df.index.max()),
+            "rows": int(len(df)),
+        },
+        "split_ranges": {
+            "train": [str(X_train.index[0]), str(X_train.index[-1])],
+            "val": [str(X_val.index[0]), str(X_val.index[-1])],
+            "test": [str(X_test.index[0]), str(X_test.index[-1])],
+        },
+        "test_metrics": test_metrics,
+    }
+
+    try:
+        version = save_model(
+            result, name=args.model_name, extra_metadata=extra_metadata
+        )
+    except Exception as e:  # noqa: BLE001
+        log.error("train.save_failed", error=str(e))
+        return 5
+
+    saved_dir = Path(settings.MODELS_DIR) / args.model_name / version
+    log.info(
+        "train.saved",
+        name=args.model_name,
+        version=version,
+        path=str(saved_dir),
+        model_kind=model_kind,
+    )
+    log.info(
+        "train.complete",
+        message=(
+            f"MODE=TRAIN finished. Model={args.model_name} "
+            f"version={version} kind={model_kind} setups={len(setup_df)} "
+            f"test_accuracy={test_metrics['accuracy']}"
+        ),
+    )
+    return 0
+
+
 def _run_promote_model(settings: Settings, log, *, args) -> int:
     """Operator-only: promote a candidate model version after review.
 
@@ -1223,8 +1670,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _run_promote_model(settings, log, args=args)
 
     if settings.MODE == "TRAIN":
-        log.warning("mode.not_implemented", mode="TRAIN", note="Day 3 deliverable")
-        return 0
+        return _run_train_from_csv(settings, log, args)
     if settings.MODE == "BACKTEST":
         if args.backtest_csv:
             return _run_backtest_from_csv(

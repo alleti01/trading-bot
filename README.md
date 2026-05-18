@@ -28,7 +28,7 @@ crypto (BTC/etc.) that:
 | Mode      | What it does                                           | Status        |
 |-----------|--------------------------------------------------------|---------------|
 | BACKTEST  | Simulate strategy on historical OHLCV CSVs             | Day 4 ✓       |
-| TRAIN     | Label setups, train baseline + boosted models          | Day 3 ✓       |
+| TRAIN     | Real OHLCV CSV → features → setups → labels → train + register  | ✓     |
 | PAPER     | Live data → strategy → model → risk → simulator         | Day 5 ✓       |
 | Reports   | Per-session Markdown report + CSV trade journal        | Day 6 ✓       |
 | Agents    | LLM advisory agents (no execution access)              | Day 7 ✓       |
@@ -110,14 +110,82 @@ Each smoke run is deterministic and lands in well under a minute.
 
 ## Real modes
 
+The end-to-end real flow is **train → backtest → paper**. Each step
+takes a real OHLCV CSV (`timestamp, open, high, low, close, volume`)
+and the train step's saved model name flows into the next two.
+
+### 1. Train a model from a real CSV
+
 ```bash
-# Backtest a real CSV with an optional model gate.
+python -m app.main \
+  --mode TRAIN \
+  --train-csv data/historical/MES/1m.csv \
+  --model-name vwap_ema_pullback_lr \
+  --model-kind logreg
+```
+
+Useful overrides (all optional):
+
+```bash
+  --model-kind lightgbm        # requires `pip install lightgbm`
+  --train-frac 0.70            # chronological train fraction (default 0.70)
+  --val-frac 0.15              # chronological val fraction (default 0.15)
+  --max-hold-bars 20           # TP/SL labeler horizon (default: settings.MAX_HOLD_BARS)
+```
+
+What the runner does:
+
+1. Loads the CSV via the OHLCV loader (validates required columns,
+   drops bad timestamps and OHLC violations, dedupes, sorts).
+2. Builds canonical features using the same feature builder the
+   strategy and predictor use.
+3. Detects setups with `VWAPEMAPullback`.
+4. Labels each setup with `label_setups` (TP / SL / time-out, with
+   conservative same-bar SL-first ambiguity resolution).
+5. Splits **strictly chronologically** by setup timestamp (no
+   shuffling, ever).
+6. Trains the selected model with walk-forward CV across (train +
+   val) and calibrates probabilities on the val window.
+7. Saves the model under `data/models/<model-name>/<version>/` with
+   `model.pkl` + a rich `metadata.json` (CSV path, strategy, model
+   kind, train/val/test ranges, label distribution, val and test
+   metrics, `MAX_HOLD_BARS`, confidence threshold).
+
+The runner refuses to train and exits non-zero on:
+
+| Condition | Exit code |
+|-----------|-----------|
+| `--train-csv` missing or path doesn't exist | 4 / 7 |
+| `--model-name` missing | 4 |
+| CSV smaller than ~200 rows (warmup floor) | 4 |
+| Strategy produces fewer than 100 setups | 4 |
+| Labels are all-positive or all-negative | 4 |
+| Required feature column missing | 4 |
+| `train_frac + val_frac >= 1` | 4 |
+| `--model-kind lightgbm` chosen but LightGBM not installed | 4 |
+
+Console output during a run includes: `train.csv_loaded`,
+`train.features_built`, `train.setups_detected`, `train.labels_built`,
+`train.split` (with each window's start/end timestamps),
+`train.metrics_val`, `train.metrics_test`, and `train.saved` (with
+the version + on-disk path).
+
+### 2. Backtest with the saved model
+
+```bash
 python -m app.main --mode BACKTEST \
   --backtest-csv data/historical/MES/1m.csv \
   --model-name vwap_ema_pullback_lr \
   --model-version latest
+```
 
-# Run the paper service forever (APScheduler).
+`--model-version latest` resolves to the most recent version in
+`data/models/<model-name>/`. Backtest writes a Markdown + JSON report
+under `data/reports/`.
+
+### 3. Run paper mode with the saved model
+
+```bash
 python -m app.main --mode PAPER \
   --paper-csv data/historical/MES/1m.csv \
   --model-name vwap_ema_pullback_lr
