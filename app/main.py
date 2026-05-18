@@ -38,6 +38,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Run a Day-2 feature/strategy smoke pass against synthetic OHLCV.",
     )
+    parser.add_argument(
+        "--smoke-train",
+        action="store_true",
+        help="Run a Day-3 train smoke pass: synthetic OHLCV -> setups -> labels -> train -> register -> predict.",
+    )
     return parser.parse_args(argv)
 
 
@@ -90,6 +95,131 @@ def _run_smoke_features(settings: Settings, log) -> int:
     return 0
 
 
+def _run_smoke_train(settings: Settings, log) -> int:
+    """Day-3 train smoke: OHLCV -> features -> setups -> labels -> train -> register -> predict."""
+    import pandas as pd
+
+    from features.feature_builder import FEATURE_COLUMNS, build_features
+    from labeling.tp_sl_labeler import label_setups
+    from models.model_registry import load_model, save_model
+    from models.predictor import Predictor
+    from models.trainer import has_lightgbm, train
+    from strategies.vwap_ema_pullback import VWAPEMAPullback
+    from tests.fixtures.synthetic import synthetic_ohlcv
+    from validation.time_split import chronological_split
+    from validation.walk_forward import walk_forward_splits
+
+    df = synthetic_ohlcv(n_bars=10_000, tz=settings.TIMEZONE)
+    log.info("smoke.ohlcv", rows=len(df), first_ts=str(df.index.min()), last_ts=str(df.index.max()))
+
+    features = build_features(df, instrument=settings.INSTRUMENT, tz=settings.TIMEZONE)
+    log.info("smoke.features", rows=len(features))
+
+    strategy = VWAPEMAPullback(instrument=settings.INSTRUMENT)
+    setups = strategy.detect_setups(features)
+    log.info(
+        "smoke.setups",
+        n=len(setups),
+        long=sum(s.direction == "long" for s in setups),
+        short=sum(s.direction == "short" for s in setups),
+    )
+    if len(setups) < 50:
+        log.error("smoke.too_few_setups", n=len(setups), need=50)
+        return 4
+
+    labels = label_setups(setups, df, max_hold_bars=20)
+
+    # Build the per-setup training table.
+    rows = []
+    for setup, lab in zip(setups, labels):
+        row = dict(setup.features)
+        row["_label"] = lab.label
+        row["_ts"] = setup.timestamp
+        rows.append(row)
+    setup_df = pd.DataFrame(rows).set_index("_ts")
+    setup_df.index = pd.DatetimeIndex(setup_df.index)
+    if not setup_df.index.is_monotonic_increasing:
+        setup_df = setup_df.sort_index()
+
+    y = setup_df["_label"].astype(int)
+    X = setup_df[list(FEATURE_COLUMNS)]
+    log.info("smoke.label_distribution", positive_rate=float(y.mean()), n=int(len(y)))
+
+    train_idx, val_idx, test_idx = chronological_split(setup_df, train_frac=0.7, val_frac=0.15)
+    X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
+    X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
+    X_test, y_test = X.iloc[test_idx], y.iloc[test_idx]
+
+    # Walk-forward splits over (train + val) — only if there is enough data.
+    n_combined = len(train_idx) + len(val_idx)
+    test_bars = max(20, n_combined // 10)
+    train_min = max(50, n_combined - 5 * test_bars)
+    wf_splits: list = []
+    try:
+        wf_splits = list(
+            walk_forward_splits(
+                X.iloc[: n_combined],
+                n_folds=3,
+                train_min_bars=train_min,
+                test_bars=test_bars,
+                purge_bars=2,
+                embargo_bars=2,
+            )
+        )
+    except ValueError as e:
+        log.warning("smoke.walk_forward_skipped", error=str(e))
+
+    # Train logistic regression baseline.
+    result_lr = train(
+        X_train, y_train, X_val, y_val,
+        model_kind="logreg",
+        walk_forward_cv=wf_splits,
+        features_full_df=X,
+    )
+    log.info(
+        "smoke.train.lr.metrics",
+        n_train=result_lr.n_train,
+        n_val=result_lr.n_val,
+        n_folds=len(result_lr.fold_metrics),
+        **{k: round(v, 4) if isinstance(v, float) else v for k, v in result_lr.aggregate_metrics.items()},
+    )
+
+    # Train LightGBM if installed (optional).
+    if has_lightgbm():
+        try:
+            result_lgb = train(
+                X_train, y_train, X_val, y_val,
+                model_kind="lightgbm",
+                walk_forward_cv=wf_splits,
+                features_full_df=X,
+            )
+            log.info("smoke.train.lgb.metrics", **{k: round(v, 4) if isinstance(v, float) else v for k, v in result_lgb.aggregate_metrics.items()})
+        except Exception as e:
+            log.warning("smoke.train.lgb.failed", error=str(e))
+    else:
+        log.info("smoke.train.lgb.skipped", reason="lightgbm not installed")
+
+    # Persist + reload + predict.
+    version = save_model(result_lr, name="vwap_ema_pullback_lr")
+    loaded = load_model("vwap_ema_pullback_lr", version=version)
+    predictor = Predictor(loaded)
+
+    test_setups = [s for s in setups if s.timestamp in set(X_test.index)][:3]
+    for s in test_setups:
+        pred = predictor.predict_setup(s)
+        log.info(
+            "smoke.predict",
+            ts=str(s.timestamp),
+            direction=s.direction,
+            probability=round(pred.probability, 4),
+            approved=pred.approved,
+            threshold=pred.threshold,
+        )
+
+    log.info("smoke.complete", message="Day 3 smoke run passed.", model_version=version)
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
 
@@ -128,6 +258,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.smoke_features:
         return _run_smoke_features(settings, log)
+
+    if args.smoke_train:
+        return _run_smoke_train(settings, log)
 
     # Real mode runners arrive on Days 3–5. For now just say so and exit.
     if settings.MODE == "TRAIN":
