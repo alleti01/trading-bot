@@ -8,7 +8,7 @@ classes in ``storage.tables`` rather than ``storage.models``.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import (
@@ -27,6 +27,16 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 def _uuid() -> str:
     return str(uuid.uuid4())
+
+
+def _utcnow() -> datetime:
+    """Tz-aware UTC now. Used as default= for DateTime(timezone=True) cols.
+
+    ``datetime.utcnow()`` returns a naive datetime which Python 3.12 has
+    deprecated and which produces inconsistent values when later compared
+    to tz-aware timestamps from market data feeds.
+    """
+    return datetime.now(timezone.utc)
 
 
 class Base(DeclarativeBase):
@@ -109,7 +119,7 @@ class ModelPrediction(Base):
     threshold: Mapped[float] = mapped_column(Float)
     approved: Mapped[bool] = mapped_column(Boolean)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow
+        DateTime(timezone=True), default=_utcnow
     )
 
 
@@ -178,7 +188,7 @@ class RiskBlock(Base):
         String(36), ForeignKey("setups.id"), nullable=True
     )
     ts: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow, index=True
+        DateTime(timezone=True), default=_utcnow, index=True
     )
     rule: Mapped[str] = mapped_column(String(64))
     reason: Mapped[str] = mapped_column(Text)
@@ -192,7 +202,7 @@ class Notification(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     ts: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow, index=True
+        DateTime(timezone=True), default=_utcnow, index=True
     )
     channel: Mapped[str] = mapped_column(String(32))  # discord | log | ...
     kind: Mapped[str] = mapped_column(String(64))    # bot.start, signal, trade, ...
@@ -206,7 +216,7 @@ class AgentOutput(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     ts: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow, index=True
+        DateTime(timezone=True), default=_utcnow, index=True
     )
     agent_name: Mapped[str] = mapped_column(String(64), index=True)
     schema_valid: Mapped[bool] = mapped_column(Boolean)
@@ -225,7 +235,7 @@ class ModelMetadata(Base):
     model_name: Mapped[str] = mapped_column(String(128), index=True)
     version: Mapped[str] = mapped_column(String(64))
     trained_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow
+        DateTime(timezone=True), default=_utcnow
     )
     data_start: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -280,7 +290,7 @@ class TradeAnalysis(Base):
     mae: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     analysis: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow, index=True
+        DateTime(timezone=True), default=_utcnow, index=True
     )
 
 
@@ -320,7 +330,7 @@ class ImprovementSuggestion(Base):
         String(36), unique=True, index=True, default=_uuid
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow, index=True
+        DateTime(timezone=True), default=_utcnow, index=True
     )
     affected_strategy: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     affected_condition: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)

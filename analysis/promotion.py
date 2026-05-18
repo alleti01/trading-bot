@@ -18,7 +18,7 @@ This module deliberately does **no** model writes itself.
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -164,7 +164,7 @@ def write_comparison_report(
 ) -> Path:
     """Persist a Markdown comparison report. The CLI consumes this for review."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    ts = timestamp or datetime.utcnow()
+    ts = timestamp or datetime.now(timezone.utc)
     name = (
         f"promotion_{decision.comparison.candidate_name}_"
         f"{decision.comparison.candidate_version}_"

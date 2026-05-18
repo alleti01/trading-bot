@@ -226,9 +226,12 @@ SchedulerService._safe_end_of_day
 Pipeline (operator-driven retraining + promotion):
 
 ```
-python -m app.main --retrain-from-feedback   # build dataset + comparison report
+python -m app.main --retrain-from-feedback   # build dataset + train candidate + comparison report
 python -m app.main --promote-model VERSION   # only if PromotionDecision says so
 ```
+
+See [Feedback retraining workflow](#feedback-retraining-workflow-paper--candidate--review--promote)
+below for the full step-by-step.
 
 Mistake tag enum (deterministic; tagged by `MistakeClassifier`):
 `false_positive` (model approved + lost materially),
@@ -263,6 +266,141 @@ ENABLE_LLM_AGENTS=true OPENAI_API_KEY=sk-... python -m app.main --mode PAPER --s
 ENABLE_LLM_AGENTS=true OPENAI_API_KEY=sk-... python -m app.main --mode PAPER
 ```
 
+## Feedback retraining workflow: paper → candidate → review → promote
+
+The bot only learns through **logged paper trades + an explicit
+operator-driven retrain step**. Strategy code, risk caps, and
+`CONFIDENCE_THRESHOLD` are *never* modified in place.
+
+### 1. Run paper mode and let trades accumulate
+
+```bash
+python -m app.main --mode PAPER \
+  --paper-csv data/historical/MES/1m.csv \
+  --model-name vwap_ema_pullback_lr
+```
+
+Each closed paper trade is persisted with:
+
+- the frozen feature snapshot at entry (`feature_snapshots.features`),
+- the model's calibrated probability + threshold + approval flag
+  (`model_predictions`),
+- the realized PnL, exit reason, slippage, and commission (`closed_trades`),
+- structured post-mortem + mistake tags (`trade_analyses`,
+  `trade_mistake_tags`).
+
+**How long to collect:** target at least `FEEDBACK_MIN_ROWS` closed
+trades (default **100**) covering both wins *and* losses across multiple
+sessions. With a paper-friendly cadence (~5–8 trades/day) that is
+roughly **2–4 weeks of trading days**. Retraining on fewer rows is
+explicitly refused — see step 3.
+
+### 2. (Optional) Inspect the dataset before retraining
+
+The retrain step writes both a CSV and a JSON dump under
+`data/reports/feedback/`. You can also generate them ahead of time by
+re-running `--retrain-from-feedback`; the dataset is built first and
+training only runs after it.
+
+### 3. Retrain a candidate model
+
+```bash
+python -m app.main --retrain-from-feedback
+```
+
+This:
+
+1. Builds the feedback dataset from `closed_trades` ⨯
+   `feature_snapshots` ⨯ `model_predictions` ⨯ `trade_mistake_tags`.
+2. Refuses to train if there are fewer than `FEEDBACK_MIN_ROWS` rows
+   (or fewer rows with full feature vectors). Exits with code `4`.
+3. Splits **strictly chronologically** by entry timestamp
+   (70% train / 15% val / 15% test). No shuffling, ever.
+4. Trains a logistic-regression baseline; calibrates on val.
+5. Optionally trains LightGBM if installed (metrics-only — the saved
+   artifact is always the calibrated logreg).
+6. Evaluates on the holdout test split: accuracy, precision, recall,
+   false-positive rate, ROC-AUC, **expectancy per trade**,
+   **profit factor**, **drawdown proxy**, and **calibration MAE** —
+   all on the trades the candidate model would have approved.
+7. Saves the candidate to
+   `data/models/<model-name>_candidate/<version>/` with
+   `metadata.json` carrying `candidate=true`, the realized trade
+   metrics, the mistake-tag counts, and the chronological split
+   ranges.
+8. Writes a Markdown promotion report under
+   `data/reports/feedback/promotion_*.md`.
+
+**The candidate is never automatically promoted.** Mistake tags are
+stored in metadata as a diagnostic signal; they are *not* used as
+labels unless you opt in with `--feedback-use-mistake-tags`.
+
+Useful overrides:
+
+```bash
+# Override min rows (e.g. for an early-validation pilot)
+python -m app.main --retrain-from-feedback --feedback-min-rows 60
+
+# Train against a non-default incumbent and pick a custom candidate name
+python -m app.main --retrain-from-feedback \
+  --model-name vwap_ema_pullback_lr \
+  --candidate-model-name vwap_ema_pullback_lr_2026_q2
+
+# Treat mistake-tagged trades as negative labels (advanced)
+python -m app.main --retrain-from-feedback --feedback-use-mistake-tags
+```
+
+### 4. Review the candidate
+
+Read the markdown report in `data/reports/feedback/`:
+
+```
+data/reports/feedback/
+├── feedback_dataset.csv
+├── feedback_dataset.json
+└── promotion_<candidate-name>_<candidate-version>_<UTC>.md
+```
+
+The report shows incumbent vs candidate side-by-side, deltas, and any
+**failed promotion gates** (expectancy, profit factor, max drawdown,
+false-positive rate, walk-forward stability).
+
+`metadata.json` for the candidate also contains the full test-split
+metrics + chronological split ranges so you can reproduce the
+evaluation independently.
+
+### 5. Promote — only after validation
+
+If, **and only if**, the report's PromotionDecision says `PROMOTE` and
+you've reviewed the metrics, run:
+
+```bash
+python -m app.main --promote-model <candidate-version> \
+  --model-name vwap_ema_pullback_lr_candidate
+```
+
+`--promote-model` re-runs the gate check at promotion time. Even if you
+hand it a candidate version that *currently* clears the gates, the
+incumbent metadata can change between retrain and promote — promotion
+re-validates against whatever's live. The runner logs the decision and
+refuses to advance the registry pointer if any gate fails.
+
+### Safety summary
+
+- **No auto-promotion.** `--retrain-from-feedback` only ever writes a
+  new *candidate* version; it never touches the incumbent's directory
+  or any "current" pointer.
+- **Min rows enforced.** Below `FEEDBACK_MIN_ROWS` the trainer raises
+  `InsufficientFeedbackError` and the CLI exits non-zero **before**
+  any model is saved.
+- **Chronological split.** `validation/time_split.chronological_split`
+  is the only splitter the candidate trainer is allowed to call.
+- **Mistake tags ≠ labels** by default. They become labels only when
+  the operator explicitly opts in.
+- **Tests:** `tests/test_feedback_retrain.py` covers feedback dataset
+  creation, the insufficient-rows block, chronological split ordering,
+  candidate save path, no-auto-promotion, and the override flags.
+
 ## Docker
 
 ```bash
@@ -295,6 +433,11 @@ vars). See `.env.example` for the full list with comments. Key knobs:
 - `LLM_TIMEOUT_SECONDS` — per-call timeout (default 30).
 - `AGENTS_RUN_AT_EOD` — whether the EOD scheduler job triggers the agents.
 - `NEWS_CHECK_LOCAL_TIME` — pre-session NewsAgent cron time (default `09:25`).
+- `FEEDBACK_MIN_ROWS` — minimum closed trades (with feature snapshots)
+  required before `--retrain-from-feedback` will train a candidate
+  (default 100). Below this the trainer refuses to run.
+- `FEEDBACK_USE_MISTAKE_TAGS_AS_LABEL` — when true, derive candidate
+  labels from mistake tags (default false; tags are metadata only).
 
 ## Adding historical CSV data
 

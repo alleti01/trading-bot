@@ -104,10 +104,14 @@ class DiscordNotifier:
         rate_limiter: Optional[DiscordRateLimiter] = None,
         timeout: float = 5.0,
         max_wait_seconds: float = 2.0,
+        max_retries: int = 2,
+        retry_backoff_seconds: float = 0.5,
     ) -> None:
         self.webhook_url = (webhook_url or "").strip()
         self.timeout = float(timeout)
         self.max_wait_seconds = float(max_wait_seconds)
+        self.max_retries = max(0, int(max_retries))
+        self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
         self.limiter = rate_limiter or DiscordRateLimiter()
         self.log = get_logger("notifications.discord")
 
@@ -124,6 +128,19 @@ class DiscordNotifier:
         if len(body) > 1900:
             body = body[:1897] + "..."
         return body
+
+    @staticmethod
+    def _parse_retry_after(response: "httpx.Response") -> float:
+        """Best-effort parse of Discord's Retry-After header (seconds)."""
+        retry_after = response.headers.get("Retry-After") or response.headers.get(
+            "retry-after"
+        )
+        if retry_after is None:
+            return 0.0
+        try:
+            return max(0.0, float(retry_after))
+        except (ValueError, TypeError):
+            return 0.0
 
     def send(self, kind: str, payload: dict) -> SendResult:
         if not self.webhook_url:
@@ -142,31 +159,88 @@ class DiscordNotifier:
                 return SendResult(delivered=False, dropped_reason="rate_limited")
 
         content = self._format_content(kind, payload)
-        try:
-            response = httpx.post(
-                self.webhook_url,
-                json={"content": content},
-                timeout=self.timeout,
+
+        last_error: Optional[str] = None
+        last_status: Optional[int] = None
+        attempts = self.max_retries + 1
+        for attempt in range(attempts):
+            try:
+                response = httpx.post(
+                    self.webhook_url,
+                    json={"content": content},
+                    timeout=self.timeout,
+                )
+                self.limiter.record()
+            except httpx.HTTPError as e:
+                last_error = str(e)
+                self.log.warning(
+                    "discord.http_error",
+                    kind=kind,
+                    error=last_error,
+                    attempt=attempt + 1,
+                )
+                if attempt < attempts - 1:
+                    time.sleep(self.retry_backoff_seconds * (2 ** attempt))
+                    continue
+                return SendResult(delivered=False, error=last_error)
+            except Exception as e:  # pragma: no cover - belt-and-braces
+                self.log.error("discord.unexpected_error", kind=kind, error=str(e))
+                return SendResult(delivered=False, error=str(e))
+
+            last_status = response.status_code
+
+            if 200 <= response.status_code < 300:
+                return SendResult(delivered=True, status_code=response.status_code)
+
+            # 429: respect server-side Retry-After.
+            if response.status_code == 429:
+                wait_s = self._parse_retry_after(response)
+                self.log.warning(
+                    "discord.rate_limited_remote",
+                    kind=kind,
+                    retry_after=round(wait_s, 2),
+                    attempt=attempt + 1,
+                )
+                if (
+                    attempt < attempts - 1
+                    and kind in HIGH_PRIORITY_KINDS
+                    and wait_s <= self.max_wait_seconds
+                ):
+                    time.sleep(wait_s)
+                    continue
+                return SendResult(
+                    delivered=False,
+                    status_code=response.status_code,
+                    dropped_reason="rate_limited_remote",
+                    error=f"HTTP 429 retry_after={wait_s:.2f}s",
+                )
+
+            # 5xx: transient, retry with exponential backoff.
+            if 500 <= response.status_code < 600 and attempt < attempts - 1:
+                self.log.warning(
+                    "discord.transient_error",
+                    kind=kind,
+                    status_code=response.status_code,
+                    attempt=attempt + 1,
+                )
+                time.sleep(self.retry_backoff_seconds * (2 ** attempt))
+                continue
+
+            # 4xx (other than 429) — no point retrying.
+            self.log.warning(
+                "discord.bad_status",
+                kind=kind,
+                status_code=response.status_code,
+                body=response.text[:200],
             )
-            self.limiter.record()
-        except httpx.HTTPError as e:
-            self.log.warning("discord.http_error", kind=kind, error=str(e))
-            return SendResult(delivered=False, error=str(e))
-        except Exception as e:  # pragma: no cover - belt-and-braces
-            self.log.error("discord.unexpected_error", kind=kind, error=str(e))
-            return SendResult(delivered=False, error=str(e))
+            return SendResult(
+                delivered=False,
+                status_code=response.status_code,
+                error=response.text[:200] or f"HTTP {response.status_code}",
+            )
 
-        if 200 <= response.status_code < 300:
-            return SendResult(delivered=True, status_code=response.status_code)
-
-        self.log.warning(
-            "discord.bad_status",
-            kind=kind,
-            status_code=response.status_code,
-            body=response.text[:200],
-        )
         return SendResult(
             delivered=False,
-            status_code=response.status_code,
-            error=response.text[:200] or f"HTTP {response.status_code}",
+            status_code=last_status,
+            error=last_error or "all retries exhausted",
         )

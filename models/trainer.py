@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 import numpy as np
@@ -344,7 +344,7 @@ def train(
 
     def _ts(idx, default_pos: int) -> datetime:
         if len(idx) == 0:
-            return datetime.utcnow()
+            return datetime.now(timezone.utc)
         ts = idx[default_pos]
         return ts.to_pydatetime() if isinstance(ts, pd.Timestamp) else ts
 

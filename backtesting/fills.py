@@ -152,8 +152,20 @@ def make_fills_model(
     *,
     slippage_ticks: float,
     commission_per_contract: float,
+    crypto_slippage_bps: float | None = None,
+    crypto_fee_bps: float | None = None,
 ) -> FillsModel:
-    """Construct the right FillsModel for an instrument by market type."""
+    """Construct the right FillsModel for an instrument by market type.
+
+    For futures the tick-based knobs apply directly. For crypto the
+    bps-based knobs apply and the futures-only knobs are *ignored* — we
+    log a warning if the operator passed non-default tick/commission
+    values into a crypto instrument so a misconfigured ``.env`` is
+    visible at boot rather than silently absorbed.
+    """
+    from app.logging_config import get_logger
+
+    log = get_logger("backtesting.fills")
     spec = get_instrument(instrument)
     if spec.market_type == "futures":
         return FuturesFillsModel(
@@ -161,4 +173,19 @@ def make_fills_model(
             slippage_ticks=slippage_ticks,
             commission_per_contract=commission_per_contract,
         )
-    return CryptoFillsModel(spec)
+
+    # Crypto path. Default to the model's safe defaults when not provided.
+    if slippage_ticks > 0 or commission_per_contract > 0:
+        log.warning(
+            "fills.crypto_drops_tick_config",
+            instrument=instrument,
+            slippage_ticks=slippage_ticks,
+            commission_per_contract=commission_per_contract,
+            note="Use CRYPTO_SLIPPAGE_BPS / CRYPTO_FEE_BPS for crypto.",
+        )
+    kwargs: dict[str, float] = {}
+    if crypto_slippage_bps is not None:
+        kwargs["slippage_bps"] = float(crypto_slippage_bps)
+    if crypto_fee_bps is not None:
+        kwargs["fee_bps"] = float(crypto_fee_bps)
+    return CryptoFillsModel(spec, **kwargs)

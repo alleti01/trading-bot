@@ -122,6 +122,33 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default="latest",
         help="Model version (default 'latest').",
     )
+    parser.add_argument(
+        "--feedback-min-rows",
+        type=int,
+        default=None,
+        help=(
+            "Override FEEDBACK_MIN_ROWS for --retrain-from-feedback. Below "
+            "this many feedback rows the candidate trainer refuses to run."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-model-name",
+        type=str,
+        default=None,
+        help=(
+            "Override the saved candidate model name for "
+            "--retrain-from-feedback (default: '<model-name>_candidate')."
+        ),
+    )
+    parser.add_argument(
+        "--feedback-use-mistake-tags",
+        action="store_true",
+        help=(
+            "When set, label = 0 for any trade carrying a mistake tag "
+            "(default: label is derived from PnL only; tags are stored as "
+            "metadata)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -233,6 +260,12 @@ def _run_smoke_train(settings: Settings, log) -> int:
     n_combined = len(train_idx) + len(val_idx)
     test_bars = max(20, n_combined // 10)
     train_min = max(50, n_combined - 5 * test_bars)
+    # ``purge_bars`` must be at least ``MAX_HOLD_BARS`` so that the last
+    # training sample's label (which depends on bars t+1..t+max_hold)
+    # cannot leak into the test window. Without this, walk-forward
+    # validation gives optimistically-biased metrics.
+    purge_bars = max(2, int(settings.MAX_HOLD_BARS))
+    embargo_bars = max(2, min(int(settings.MAX_HOLD_BARS // 4), test_bars - 1))
     wf_splits: list = []
     try:
         wf_splits = list(
@@ -241,8 +274,8 @@ def _run_smoke_train(settings: Settings, log) -> int:
                 n_folds=3,
                 train_min_bars=train_min,
                 test_bars=test_bars,
-                purge_bars=2,
-                embargo_bars=2,
+                purge_bars=purge_bars,
+                embargo_bars=embargo_bars,
             )
         )
     except ValueError as e:
@@ -400,14 +433,29 @@ def _run_backtest_from_csv(
     model_name: Optional[str],
     model_version: str,
 ) -> int:
+    from pathlib import Path
+
     from data.csv_loader import load_ohlcv_csv
 
-    df = load_ohlcv_csv(
-        path=csv_path,
-        instrument=settings.INSTRUMENT,
-        timeframe="1m",
-        tz=settings.TIMEZONE,
-    )
+    if not Path(csv_path).exists():
+        log.error("backtest.csv_missing", path=str(csv_path))
+        return 7
+
+    try:
+        df = load_ohlcv_csv(
+            path=csv_path,
+            instrument=settings.INSTRUMENT,
+            timeframe="1m",
+            tz=settings.TIMEZONE,
+        )
+    except Exception as e:
+        log.error("backtest.csv_load_failed", path=str(csv_path), error=str(e))
+        return 7
+
+    if df.empty:
+        log.error("backtest.csv_empty", path=str(csv_path))
+        return 7
+
     return _run_backtest(
         settings,
         log,
@@ -874,19 +922,50 @@ def _run_smoke_trade_analysis(settings: Settings, log) -> int:
     return 0
 
 
-def _run_retrain_from_feedback(settings: Settings, log) -> int:
-    """Build the feedback dataset, train a candidate model, write a
-    promotion comparison report. NEVER promotes the new model — the
-    operator must run ``--promote-model`` after reviewing the report.
+def _run_retrain_from_feedback(settings: Settings, log, *, args=None) -> int:
+    """Train a candidate model from closed paper trades, save it under
+    a *candidate* version in the registry, and write a promotion
+    comparison report against the incumbent.
+
+    Hard guarantees:
+
+    - **Never auto-promotes.** ``compare()`` returns an advisory
+      :class:`PromotionDecision`; this runner does *not* move any
+      registry pointer. Promotion requires the explicit
+      ``--promote-model VERSION`` CLI step, which itself re-runs the
+      gate check.
+    - Refuses to run on too few rows (``FEEDBACK_MIN_ROWS``).
+    - Splits chronologically only — never randomly.
+    - Mistake tags become metadata; they only become labels when the
+      operator opts in via ``--feedback-use-mistake-tags``.
     """
     from pathlib import Path
 
     from analysis.feedback_dataset import FeedbackDataset
+    from analysis.feedback_trainer import (
+        InsufficientFeedbackError,
+        train_candidate_from_feedback,
+    )
     from analysis.promotion import compare, write_comparison_report
-    from models.model_registry import load_model
+    from models.model_registry import load_model, save_model
+
+    incumbent_name = (args.model_name if args else None) or "vwap_ema_pullback_lr"
+    candidate_name = (
+        (args.candidate_model_name if args else None) or f"{incumbent_name}_candidate"
+    )
+    min_rows = (
+        int(args.feedback_min_rows)
+        if (args and args.feedback_min_rows is not None)
+        else int(settings.FEEDBACK_MIN_ROWS)
+    )
+    use_mistake_tags = bool(
+        (args.feedback_use_mistake_tags if args else False)
+        or settings.FEEDBACK_USE_MISTAKE_TAGS_AS_LABEL
+    )
 
     dataset = FeedbackDataset()
     rows = dataset.build()
+
     out_dir = Path(settings.REPORTS_DIR) / "feedback"
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = dataset.export_csv(rows, out_dir / "feedback_dataset.csv")
@@ -894,39 +973,120 @@ def _run_retrain_from_feedback(settings: Settings, log) -> int:
     log.info(
         "retrain.dataset_built",
         n=len(rows),
+        min_rows=min_rows,
         csv_path=str(csv_path),
         json_path=str(json_path),
     )
 
-    if len(rows) < 30:
-        log.warning(
-            "retrain.too_few_trades",
+    if len(rows) < min_rows:
+        log.error(
+            "retrain.insufficient_rows",
             n=len(rows),
-            note="Need >= 30 closed trades before retraining; aborting candidate train.",
+            required=min_rows,
+            note=(
+                "Need >= FEEDBACK_MIN_ROWS closed trades before retraining. "
+                "Run paper mode longer (target ~2-4 weeks of trading days for "
+                "the default of 100) or pass --feedback-min-rows to override."
+            ),
         )
-        return 0
+        return 4
 
-    # Candidate training requires a stored incumbent + a real feature
-    # matrix. We deliberately do NOT auto-pick which model name to train
-    # against; an operator must already have an incumbent registered.
     try:
-        incumbent_loaded = load_model("vwap_ema_pullback_lr")
-    except Exception as e:
+        candidate = train_candidate_from_feedback(
+            rows,
+            min_rows=min_rows,
+            confidence_threshold=settings.CONFIDENCE_THRESHOLD,
+            use_mistake_tags_as_label=use_mistake_tags,
+        )
+    except InsufficientFeedbackError as e:
+        log.error(
+            "retrain.insufficient_feedback",
+            error=str(e),
+            note="Train aborted; nothing written to the model registry.",
+        )
+        return 4
+    except Exception as e:  # noqa: BLE001 - surface any trainer failure cleanly
+        log.error("retrain.train_failed", error=str(e))
+        return 5
+
+    # Build the metadata payload that distinguishes this artifact as a
+    # candidate. ``save_model`` will merge this into ``metadata.json``.
+    extra_metadata = {
+        "candidate": True,
+        "source": "feedback_dataset",
+        "incumbent_name": incumbent_name,
+        "label_strategy": candidate.label_strategy,
+        "feedback_min_rows": min_rows,
+        "n_total": candidate.n_total,
+        "n_train": candidate.n_train,
+        "n_val": candidate.n_val,
+        "n_test": candidate.n_test,
+        "test_metrics": candidate.test_metrics,
+        "realized_metrics": candidate.realized_metrics,
+        "feedback_train_range": [r.isoformat() for r in candidate.train_range],
+        "feedback_val_range": [r.isoformat() for r in candidate.val_range],
+        "feedback_test_range": [r.isoformat() for r in candidate.test_range],
+        "mistake_tag_counts": candidate.mistake_tag_counts,
+        "excluded_no_features": candidate.excluded_no_features,
+        "boosted_trained": candidate.boosted_train_result is not None,
+        "boosted_metrics": (
+            candidate.boosted_train_result.aggregate_metrics
+            if candidate.boosted_train_result is not None
+            else None
+        ),
+    }
+    candidate_version = save_model(
+        candidate.train_result,
+        name=candidate_name,
+        extra_metadata=extra_metadata,
+    )
+    log.info(
+        "retrain.candidate_saved",
+        name=candidate_name,
+        version=candidate_version,
+        n_train=candidate.n_train,
+        n_test=candidate.n_test,
+        test_precision=round(candidate.test_metrics["precision"], 4),
+        test_recall=round(candidate.test_metrics["recall"], 4),
+        expectancy=round(candidate.realized_metrics["expectancy_per_trade"], 4),
+        profit_factor=round(candidate.realized_metrics["profit_factor"], 4),
+    )
+
+    # Promotion comparison — advisory only. We deliberately do NOT
+    # promote here. Operator must run --promote-model VERSION after
+    # reviewing the report.
+    incumbent_metadata: Optional[dict] = None
+    try:
+        incumbent_loaded = load_model(incumbent_name)
+        incumbent_metadata = incumbent_loaded.metadata
+    except Exception as e:  # noqa: BLE001 - first-time retrain has no incumbent
         log.warning(
             "retrain.no_incumbent",
+            name=incumbent_name,
             error=str(e),
-            note="Skipping comparison; train an initial model first via --smoke-train.",
+            note=(
+                "No incumbent registered yet — comparison skipped. The "
+                "candidate is saved and can become the incumbent via "
+                f"--promote-model {candidate_version} once an incumbent "
+                "exists; until then, train an initial model first."
+            ),
         )
         return 0
 
-    # Building a real candidate trainer + walk-forward over the feedback
-    # dataset is intentionally out of scope for this smoke path; the
-    # comparison report against the incumbent (using its own metadata)
-    # already exercises the gate logic. Operators wire their offline
-    # trainer to ``analysis.promotion.compare`` directly.
+    candidate_metadata = dict(incumbent_loaded.metadata)
+    candidate_metadata.update(
+        {
+            "name": candidate_name,
+            "version": candidate_version,
+            "metrics": candidate.train_result.aggregate_metrics,
+            "fold_metrics": [],  # candidate uses chronological split, not WF
+        }
+    )
+
     decision = compare(
-        incumbent_metadata=incumbent_loaded.metadata,
-        candidate_metadata=incumbent_loaded.metadata,  # placeholder candidate
+        incumbent_metadata=incumbent_metadata,
+        candidate_metadata=candidate_metadata,
+        realized_metrics_candidate=candidate.realized_metrics,
     )
     report_path = write_comparison_report(decision, out_dir)
     log.info(
@@ -934,6 +1094,10 @@ def _run_retrain_from_feedback(settings: Settings, log) -> int:
         promote=decision.promote,
         failed_gates=decision.failed_gates,
         report=str(report_path),
+        note=(
+            "Decision is advisory. Run --promote-model VERSION to actually "
+            "promote (the gate check will be re-run there)."
+        ),
     )
     return 0
 
@@ -1053,7 +1217,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _run_smoke_trade_analysis(settings, log)
 
     if args.retrain_from_feedback:
-        return _run_retrain_from_feedback(settings, log)
+        return _run_retrain_from_feedback(settings, log, args=args)
 
     if args.promote_model:
         return _run_promote_model(settings, log, args=args)
@@ -1077,9 +1241,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
     if settings.MODE == "PAPER":
         return _run_paper_forever(settings, log, args=args)
-    # LIVE has already been refused by the settings validator if not configured.
-    log.warning("mode.live_unsupported", note="No live adapter implemented in this MVP.")
-    return 0
+    # Defense-in-depth: even if the settings validator was bypassed (e.g.,
+    # an operator set LIVE_ADAPTER_CONFIRMED=true and reached this branch),
+    # the dispatcher refuses to advance into anything that resembles real
+    # execution. A real live adapter would be wired in here in a future
+    # implementation; for the MVP we exit cleanly with a non-zero code so
+    # callers can detect the misconfiguration.
+    log.error(
+        "mode.live_unsupported",
+        mode=settings.MODE,
+        note=(
+            "LIVE mode reached the dispatcher but no live adapter is "
+            "implemented in this MVP. Refusing to start."
+        ),
+    )
+    return 6
 
 
 if __name__ == "__main__":

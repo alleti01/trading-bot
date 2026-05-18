@@ -66,9 +66,24 @@ class Settings(BaseSettings):
     # ---- Model ---------------------------------------------------------
     CONFIDENCE_THRESHOLD: float = 0.60
 
+    # ---- Retrain-from-feedback ----------------------------------------
+    # Minimum number of closed paper trades (with feature snapshots)
+    # before the candidate trainer will run. Below this, retraining
+    # exits with a clear error rather than fitting on noise.
+    FEEDBACK_MIN_ROWS: int = Field(default=100, ge=10)
+    # If true, derive labels from MistakeClassifier tags (label=0 for
+    # any trade tagged with a mistake) instead of raw PnL > 0. Mistake
+    # tags are otherwise stored as metadata only — never as the label.
+    FEEDBACK_USE_MISTAKE_TAGS_AS_LABEL: bool = False
+
     # ---- Costs ---------------------------------------------------------
+    # Futures: tick-based slippage + flat per-contract commission.
     SLIPPAGE_TICKS: float = Field(default=1.0, ge=0.0)
     COMMISSION_PER_CONTRACT: float = Field(default=1.50, ge=0.0)
+    # Crypto: basis-point slippage + basis-point fee. Independent knobs so
+    # ``MARKET_TYPE=crypto`` users don't silently inherit MES defaults.
+    CRYPTO_SLIPPAGE_BPS: float = Field(default=1.0, ge=0.0)
+    CRYPTO_FEE_BPS: float = Field(default=5.0, ge=0.0)
 
     # ---- Compliance ----------------------------------------------------
     CONSISTENCY_LIMIT_PERCENT: float = Field(default=30.0, gt=0.0, le=100.0)

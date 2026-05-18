@@ -27,6 +27,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from backtesting.portfolio import Portfolio
+from config.instruments import InstrumentSpec, get_instrument
 from config.settings import Settings
 from strategies.base import Setup
 
@@ -61,6 +62,11 @@ class RiskConfig:
     cooldown_after_large_win_minutes: int
     large_win_threshold: float
     market_type: str  # "futures" | "crypto"
+    # Hard cap on how much the per-contract risk is allowed to overshoot
+    # ``risk_per_trade``. ``1.0`` means we refuse the trade as soon as a
+    # single contract risks more than ``risk_per_trade``. Strategies with
+    # very wide stops would otherwise silently bypass the per-trade cap.
+    risk_per_trade: float = 0.0
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "RiskConfig":
@@ -77,6 +83,7 @@ class RiskConfig:
             cooldown_after_large_win_minutes=settings.COOLDOWN_AFTER_LARGE_WIN_MINUTES,
             large_win_threshold=settings.LARGE_WIN_THRESHOLD,
             market_type=settings.MARKET_TYPE,
+            risk_per_trade=settings.RISK_PER_TRADE,
         )
 
 
@@ -99,6 +106,7 @@ def evaluate(
     *,
     kill_switch_tripped: bool = False,
     high_risk_news_window: bool = False,
+    instrument_spec: Optional[InstrumentSpec] = None,
 ) -> RiskDecision:
     """Return a single ``RiskDecision`` for a candidate setup.
 
@@ -176,12 +184,38 @@ def evaluate(
     if cooldown_block is not None:
         return cooldown_block
 
+    # 10. Per-trade risk cap. A strategy with a very wide stop can
+    #     produce a single-contract risk that exceeds ``risk_per_trade``.
+    #     The position sizer floors qty at 1, so without this rule the
+    #     trade would silently overshoot the per-trade cap. We refuse it
+    #     here so the per-trade risk envelope is honored.
+    if config.risk_per_trade > 0:
+        spec = instrument_spec or _try_get_instrument(setup.instrument)
+        if spec is not None:
+            distance = abs(float(setup.entry_price) - float(setup.stop_price))
+            risk_per_contract = distance * spec.point_value
+            if risk_per_contract > config.risk_per_trade + 1e-9:
+                return _block(
+                    "risk_per_trade_exceeded",
+                    f"1-contract risk {risk_per_contract:.2f} exceeds "
+                    f"RISK_PER_TRADE={config.risk_per_trade:.2f}. "
+                    "Tighten the strategy stop or raise RISK_PER_TRADE.",
+                )
+
     return _allow()
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _try_get_instrument(symbol: str) -> Optional[InstrumentSpec]:
+    """Best-effort instrument lookup. Unknown symbol → None (no per-trade check)."""
+    try:
+        return get_instrument(symbol)
+    except KeyError:
+        return None
+
+
 def _within_trading_window(now: datetime, config: RiskConfig) -> bool:
     local = now.astimezone(ZoneInfo(config.timezone)).time()
     return config.trading_window_start <= local <= config.trading_window_end

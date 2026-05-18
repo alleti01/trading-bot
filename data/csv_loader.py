@@ -59,6 +59,19 @@ def load_ohlcv_csv(
     n_nan_rows = int(df[list(NUMERIC_COLUMNS)].isna().any(axis=1).sum())
     df = df.dropna(subset=list(NUMERIC_COLUMNS))
 
+    # OHLC consistency: drop rows where the candle is geometrically
+    # impossible. Bad data poisons feature engineering silently — better
+    # to drop the row and surface the count in logs.
+    bad_ohlc_mask = (
+        (df["high"] < df["low"])
+        | (df["high"] < df[["open", "close"]].max(axis=1))
+        | (df["low"] > df[["open", "close"]].min(axis=1))
+        | (df["volume"] < 0)
+    )
+    n_bad_ohlc = int(bad_ohlc_mask.sum())
+    if n_bad_ohlc:
+        df = df.loc[~bad_ohlc_mask]
+
     df = df.sort_values("timestamp", kind="mergesort")
     n_before_dedupe = len(df)
     df = df.drop_duplicates(subset=["timestamp"], keep="last")
@@ -82,6 +95,7 @@ def load_ohlcv_csv(
         rows_out=len(df),
         bad_timestamps_dropped=n_bad_ts,
         nan_rows_dropped=n_nan_rows,
+        bad_ohlc_dropped=n_bad_ohlc,
         duplicates_dropped=n_dupes,
         first_ts=str(df.index.min()) if len(df) else None,
         last_ts=str(df.index.max()) if len(df) else None,

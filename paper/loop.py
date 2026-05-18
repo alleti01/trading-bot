@@ -166,6 +166,8 @@ class PaperTradingLoop:
             settings.INSTRUMENT,
             slippage_ticks=settings.SLIPPAGE_TICKS,
             commission_per_contract=settings.COMMISSION_PER_CONTRACT,
+            crypto_slippage_bps=settings.CRYPTO_SLIPPAGE_BPS,
+            crypto_fee_bps=settings.CRYPTO_FEE_BPS,
         )
         self.executor = executor or PaperExecutor(
             portfolio=self.portfolio,
@@ -182,6 +184,7 @@ class PaperTradingLoop:
         self.trading_enabled: bool = predictor is not None or True  # default-on
         self._bar_index = 0
         self._last_bar_ts: Optional[datetime] = None
+        self._last_bar_close: Optional[float] = None
         self._last_seen_setup_ids: set[str] = set()
         # Day 8: per-trade analysis hook + MFE/MAE tracker.
         # ``trade_closed_callback`` accepts (closed_trade_id, mfe, mae,
@@ -228,6 +231,7 @@ class PaperTradingLoop:
         result.bar_ts = poll.new_candle.ts
         self._bar_index += 1
         self._last_bar_ts = poll.new_candle.ts
+        self._last_bar_close = float(poll.new_candle.close)
 
         bar_series = self._bar_to_series(poll.new_candle)
 
@@ -264,18 +268,30 @@ class PaperTradingLoop:
         """Close any open position immediately at the *last seen* bar's close.
 
         Called by the scheduler at end-of-day. Returns True iff a position
-        was closed.
+        was closed. If the loop has not yet seen any bars (no
+        ``_last_bar_close``) we fall back to the position's entry price —
+        this only happens in the degenerate "scheduler tripped flat
+        before any data arrived" case and produces a near-zero net move
+        (intentional: we cannot invent a price we haven't observed).
         """
         if self.portfolio.open_position is None:
             return False
         ts = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
-        # Use the open's entry price as a fallback raw price if we have no
-        # newer bar — fills model will still apply slippage either way.
-        last_close: float
-        if self._last_bar_ts is not None and self.portfolio.open_position is not None:
-            last_close = self.portfolio.open_position.entry_price
+
+        if self._last_bar_close is not None:
+            last_close = float(self._last_bar_close)
         else:
-            last_close = self.portfolio.open_position.entry_price  # type: ignore[union-attr]
+            self.log.warning(
+                "loop.flatten_no_bar_seen",
+                detail="No bar observed yet; closing at entry price.",
+            )
+            last_close = float(self.portfolio.open_position.entry_price)
+
+        # Snapshot in-memory excursion + entry context BEFORE the close.
+        mfe = float(self._excursion.mfe)
+        mae = float(self._excursion.mae)
+        news_at_entry = bool(self._excursion.news_risk_at_entry)
+        confidence_at_entry = self._last_predictor_confidence
 
         record = self.executor.close_position(
             ts=ts,
@@ -283,6 +299,9 @@ class PaperTradingLoop:
             exit_reason=reason,
             bar_index=self._bar_index,
         )
+        self._excursion.reset()
+        self._last_predictor_confidence = None
+
         self.notifier.notify(
             "forced_flat",
             instrument=record.instrument,
@@ -290,6 +309,22 @@ class PaperTradingLoop:
             net_pnl=round(record.net_pnl, 2),
             ts=ts.isoformat(),
         )
+
+        # Day 8 hook also fires for forced-flat closes so the trade
+        # analysis layer sees every closed position, not only TP/SL/time
+        # exits processed in ``_maybe_exit_open``.
+        closed_trade_id = getattr(self.executor, "last_closed_trade_id", None)
+        if self._trade_closed_callback is not None and closed_trade_id:
+            try:
+                self._trade_closed_callback(
+                    closed_trade_id,
+                    mfe,
+                    mae,
+                    news_at_entry,
+                    confidence_at_entry,
+                )
+            except Exception as e:
+                self.log.warning("loop.trade_closed_callback_failed", error=str(e))
         return True
 
     # ------------------------------------------------------------------
@@ -480,6 +515,7 @@ class PaperTradingLoop:
             now,
             kill_switch_tripped=self.kill_switch.is_tripped(),
             high_risk_news_window=high_risk_news,
+            instrument_spec=self.spec,
         )
         if not decision.allowed:
             self._persist_risk_block(setup, decision, now)

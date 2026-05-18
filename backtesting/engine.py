@@ -115,6 +115,8 @@ class BacktestEngine:
             settings.INSTRUMENT,
             slippage_ticks=settings.SLIPPAGE_TICKS,
             commission_per_contract=settings.COMMISSION_PER_CONTRACT,
+            crypto_slippage_bps=settings.CRYPTO_SLIPPAGE_BPS,
+            crypto_fee_bps=settings.CRYPTO_FEE_BPS,
         )
         self.tz = ZoneInfo(settings.TIMEZONE)
         self.log = get_logger("backtesting.engine")
@@ -309,6 +311,7 @@ class BacktestEngine:
             self.portfolio,
             self.risk_config,
             ts_py,
+            instrument_spec=self.spec,
         )
         if not decision.allowed:
             result.n_setups_risk_blocked += 1
