@@ -177,6 +177,17 @@ class MockLLMClient(LLMClient):
                 "reason": "Insufficient signal volume to evaluate drift.",
             }
         ),
+        "trade_analysis": json.dumps(
+            {
+                "trade_id": "unknown",
+                "headline": "Routine trade.",
+                "why_taken": "Plan + model + risk all aligned at entry.",
+                "why_outcome": "Outcome consistent with the deterministic exit reason.",
+                "mistake_summary": "No specific mistakes flagged.",
+                "review_notes": [],
+                "confidence_in_analysis": "low",
+            }
+        ),
     }
 
     def __init__(

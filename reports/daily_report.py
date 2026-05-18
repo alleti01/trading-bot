@@ -35,7 +35,14 @@ from config.instruments import get_instrument
 from config.settings import Settings
 from scheduler.market_hours import session_date
 from storage.db import session_scope
-from storage.tables import ClosedTrade, Notification, RiskBlock
+from storage.tables import (
+    ClosedTrade,
+    ImprovementSuggestion,
+    Notification,
+    RiskBlock,
+    TradeAnalysis,
+    TradeMistakeTag,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +177,94 @@ def _query_session(
     return records, risk_rows, by_kind
 
 
+def _query_analysis_section(
+    settings: Settings, *, now: datetime
+) -> dict[str, Any]:
+    """Day 8: pull mistake-tag counts, false positives, best/worst trades,
+    and proposed improvements for today's session."""
+    start_utc, end_utc = _session_window_utc(now, settings)
+
+    with session_scope() as session:
+        analyses = list(
+            session.execute(
+                select(TradeAnalysis).where(
+                    TradeAnalysis.entry_ts >= start_utc,
+                    TradeAnalysis.entry_ts < end_utc,
+                )
+            ).scalars().all()
+        )
+        if not analyses:
+            return {
+                "n_analyzed": 0,
+                "top_mistake_tags": [],
+                "false_positives": 0,
+                "best_trade": None,
+                "worst_trade": None,
+                "proposed_improvements": [],
+            }
+        analysis_ids = [a.id for a in analyses]
+        tag_rows = list(
+            session.execute(
+                select(TradeMistakeTag).where(
+                    TradeMistakeTag.trade_analysis_id.in_(analysis_ids)
+                )
+            ).scalars().all()
+        )
+        proposals = list(
+            session.execute(
+                select(ImprovementSuggestion)
+                .where(
+                    ImprovementSuggestion.created_at >= start_utc,
+                    ImprovementSuggestion.created_at < end_utc,
+                    ImprovementSuggestion.validation_status == "proposed",
+                )
+                .order_by(ImprovementSuggestion.created_at.desc())
+                .limit(20)
+            ).scalars().all()
+        )
+
+    tag_counts: dict[str, int] = {}
+    fp_set: set[str] = set()
+    for t in tag_rows:
+        tag_counts[t.tag] = tag_counts.get(t.tag, 0) + 1
+        if t.tag == "false_positive":
+            fp_set.add(t.closed_trade_id)
+
+    best = max(analyses, key=lambda a: float(a.net_pnl))
+    worst = min(analyses, key=lambda a: float(a.net_pnl))
+
+    def _slim(a: TradeAnalysis) -> dict[str, Any]:
+        return {
+            "trade_id": a.closed_trade_id,
+            "instrument": a.instrument,
+            "direction": a.direction,
+            "strategy": a.strategy_name,
+            "result": a.result,
+            "net_pnl": float(a.net_pnl),
+            "exit_reason": a.exit_reason,
+            "r_multiple": float(a.r_multiple or 0.0),
+        }
+
+    return {
+        "n_analyzed": len(analyses),
+        "top_mistake_tags": sorted(tag_counts.items(), key=lambda kv: -kv[1])[:10],
+        "false_positives": len(fp_set),
+        "best_trade": _slim(best),
+        "worst_trade": _slim(worst),
+        "proposed_improvements": [
+            {
+                "suggestion_id": p.suggestion_id,
+                "reason": p.reason,
+                "affected_strategy": p.affected_strategy,
+                "affected_condition": p.affected_condition,
+                "risk_of_overfitting": p.risk_of_overfitting,
+                "validation_status": p.validation_status,
+            }
+            for p in proposals
+        ],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Lightweight summary
 # ---------------------------------------------------------------------------
@@ -240,6 +335,8 @@ def build_daily_report_payload(
 
     sd = session_date(now, settings)
 
+    analysis_section = _query_analysis_section(settings, now=now)
+
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "session_date": sd.isoformat(),
@@ -250,6 +347,7 @@ def build_daily_report_payload(
         "metrics": metrics.to_dict(),
         "daily_pnl": daily_pnl_table(records),
         "trades": [_trade_row(r) for r in records],
+        "analysis": analysis_section,
         "risk_blocks": [
             {
                 "ts": rb.ts.isoformat() if rb.ts else None,
@@ -386,6 +484,52 @@ def render_daily_markdown(payload: dict[str, Any]) -> str:
                 f"| {t['exit_reason']} | {t['net_pnl']:.2f} | {t['bars_held']} |"
             )
     lines.append("")
+
+    # ----- Day 8: trade analysis & proposed improvements -----
+    a = payload.get("analysis") or {}
+    if a.get("n_analyzed", 0) > 0:
+        lines.append("## Trade analysis")
+        lines.append("")
+        lines.append(
+            f"- Analyzed: **{a['n_analyzed']}** "
+            f"(false positives: {a.get('false_positives', 0)})"
+        )
+        if a.get("top_mistake_tags"):
+            lines.append("- Top mistake tags:")
+            for tag, n in a["top_mistake_tags"]:
+                lines.append(f"  - `{tag}` x {n}")
+        best = a.get("best_trade")
+        worst = a.get("worst_trade")
+        if best:
+            lines.append(
+                f"- Best trade: `{best['trade_id']}` "
+                f"({best['direction']} {best['strategy'] or '?'} → {best['result']}, "
+                f"${best['net_pnl']:.2f}, R={best['r_multiple']:.2f})"
+            )
+        if worst:
+            lines.append(
+                f"- Worst trade: `{worst['trade_id']}` "
+                f"({worst['direction']} {worst['strategy'] or '?'} → {worst['result']}, "
+                f"${worst['net_pnl']:.2f}, R={worst['r_multiple']:.2f})"
+            )
+        lines.append("")
+    proposals = (a.get("proposed_improvements") or []) if a else []
+    if proposals:
+        lines.append("## Proposed improvements (need backtesting)")
+        lines.append("")
+        lines.append(
+            "These are logged with `validation_status='proposed'`. They are "
+            "**never** auto-applied; promote only via `--retrain-from-feedback` "
+            "+ `--promote-model`."
+        )
+        lines.append("")
+        for p in proposals:
+            lines.append(
+                f"- `{p['suggestion_id']}` "
+                f"(overfit risk: {p.get('risk_of_overfitting', '?')}) — "
+                f"{p['reason']}"
+            )
+        lines.append("")
 
     # ----- Notifications summary -----
     lines.append("## Notifications")

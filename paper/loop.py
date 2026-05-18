@@ -49,6 +49,7 @@ from risk.risk_engine import RiskConfig, evaluate
 from scheduler.market_hours import is_force_flat_due, is_in_trading_window
 from sqlalchemy import select
 from storage.db import session_scope
+from storage.tables import FeatureSnapshot as FeatureSnapshotRow
 from storage.tables import ModelPrediction as ModelPredictionRow
 from storage.tables import RiskBlock as RiskBlockRow
 from storage.tables import Setup as SetupRow
@@ -74,6 +75,59 @@ class BarCycleResult:
     in_window: bool = False
     trading_enabled: bool = True
     errors: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _ExcursionTracker:
+    """Tracks max favorable / max adverse excursion ($) for the open position.
+
+    Rebased on each call to :meth:`begin`. Updated bar-by-bar in
+    :meth:`update_bar`. Read once at close into the trade analysis.
+    """
+
+    direction: str = "long"
+    entry_price: float = 0.0
+    point_value: float = 1.0
+    quantity: float = 1.0
+    mfe: float = 0.0  # max favorable excursion in dollars (>= 0)
+    mae: float = 0.0  # max adverse excursion in dollars (>= 0)
+    news_risk_at_entry: bool = False
+
+    def begin(
+        self,
+        *,
+        direction: str,
+        entry_price: float,
+        point_value: float,
+        quantity: float,
+        news_risk_at_entry: bool,
+    ) -> None:
+        self.direction = direction
+        self.entry_price = float(entry_price)
+        self.point_value = float(point_value)
+        self.quantity = float(quantity)
+        self.mfe = 0.0
+        self.mae = 0.0
+        self.news_risk_at_entry = bool(news_risk_at_entry)
+
+    def update_bar(self, *, high: float, low: float) -> None:
+        if self.direction == "long":
+            best_move = float(high) - self.entry_price
+            worst_move = self.entry_price - float(low)
+        else:
+            best_move = self.entry_price - float(low)
+            worst_move = float(high) - self.entry_price
+        best_dollars = max(0.0, best_move) * self.point_value * self.quantity
+        worst_dollars = max(0.0, worst_move) * self.point_value * self.quantity
+        if best_dollars > self.mfe:
+            self.mfe = best_dollars
+        if worst_dollars > self.mae:
+            self.mae = worst_dollars
+
+    def reset(self) -> None:
+        self.mfe = 0.0
+        self.mae = 0.0
+        self.news_risk_at_entry = False
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +183,31 @@ class PaperTradingLoop:
         self._bar_index = 0
         self._last_bar_ts: Optional[datetime] = None
         self._last_seen_setup_ids: set[str] = set()
+        # Day 8: per-trade analysis hook + MFE/MAE tracker.
+        # ``trade_closed_callback`` accepts (closed_trade_id, mfe, mae,
+        # news_risk_at_entry, model_confidence). The loop never imports the
+        # analysis package directly so the callback can be plugged in by the
+        # service builder (or left as a no-op in tests / smoke).
+        self._trade_closed_callback: Optional[
+            Callable[[str, Optional[float], Optional[float], bool, Optional[float]], None]
+        ] = None
+        self._excursion = _ExcursionTracker()
+        self._last_predictor_confidence: Optional[float] = None
         self.log = get_logger("paper.loop")
+
+    def set_trade_closed_callback(
+        self,
+        callback: Optional[
+            Callable[[str, Optional[float], Optional[float], bool, Optional[float]], None]
+        ],
+    ) -> None:
+        """Wire (or unwire) the post-close analysis hook.
+
+        The hook is called *after* the deterministic close + DB write. A
+        callback failure must not propagate — the analysis layer is
+        already required to swallow its own exceptions.
+        """
+        self._trade_closed_callback = callback
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -237,6 +315,14 @@ class PaperTradingLoop:
         if isinstance(bar_ts, pd.Timestamp):
             bar_ts = bar_ts.to_pydatetime()
 
+        # Track MFE/MAE on every bar the position is open — including the
+        # exit bar itself, since the bar's range tells us the in-bar high
+        # water mark / drawdown before the close decision.
+        self._excursion.update_bar(
+            high=float(bar_series["high"]),
+            low=float(bar_series["low"]),
+        )
+
         decision = check_exit(
             position=pos,
             bar=bar_series,
@@ -249,12 +335,22 @@ class PaperTradingLoop:
         )
         if decision is None:
             return False
+
+        # Snapshot excursion + entry context BEFORE close_position resets it.
+        mfe = float(self._excursion.mfe)
+        mae = float(self._excursion.mae)
+        news_at_entry = bool(self._excursion.news_risk_at_entry)
+        confidence_at_entry = self._last_predictor_confidence
+
         record = self.executor.close_position(
             ts=bar_ts,
             exit_raw_price=decision.raw_price,
             exit_reason=decision.reason,
             bar_index=self._bar_index,
         )
+        self._excursion.reset()
+        self._last_predictor_confidence = None
+
         self.notifier.notify(
             "trade.closed",
             instrument=record.instrument,
@@ -263,6 +359,23 @@ class PaperTradingLoop:
             net_pnl=round(record.net_pnl, 2),
             ts=bar_ts.isoformat(),
         )
+
+        # Day 8: post-trade analysis hook. The callback is responsible for
+        # joining closed_trade_id to setups + predictions. We only pass
+        # the volatile in-memory data (MFE/MAE, news flag at entry,
+        # confidence at entry) that the DB does not know about.
+        closed_trade_id = getattr(self.executor, "last_closed_trade_id", None)
+        if self._trade_closed_callback is not None and closed_trade_id:
+            try:
+                self._trade_closed_callback(
+                    closed_trade_id,
+                    mfe,
+                    mae,
+                    news_at_entry,
+                    confidence_at_entry,
+                )
+            except Exception as e:
+                self.log.warning("loop.trade_closed_callback_failed", error=str(e))
         return True
 
     def _consider_new_entries(
@@ -338,6 +451,7 @@ class PaperTradingLoop:
         )
 
         # Optional model gate.
+        confidence_for_trade: Optional[float] = None
         if self.predictor is not None:
             try:
                 pred = self.predictor.predict_setup(setup)
@@ -346,6 +460,7 @@ class PaperTradingLoop:
                 result.setups_model_rejected += 1
                 return
             self._persist_prediction(setup, pred)
+            confidence_for_trade = float(pred.probability)
             if not pred.approved:
                 result.setups_model_rejected += 1
                 return
@@ -408,6 +523,19 @@ class PaperTradingLoop:
             self._record_error(result, "executor.failed", e)
             return
 
+        # Begin tracking MFE/MAE for the freshly-opened position, and
+        # snapshot the news flag at *entry* time so the trade analysis
+        # later reflects what the agent flag was when we entered, not
+        # what it might be at exit.
+        self._excursion.begin(
+            direction=setup.direction,
+            entry_price=fill.fill_price,
+            point_value=self.spec.point_value,
+            quantity=order.quantity,
+            news_risk_at_entry=high_risk_news,
+        )
+        self._last_predictor_confidence = confidence_for_trade
+
         result.setups_filled += 1
         self.notifier.notify(
             "trade.opened",
@@ -424,6 +552,13 @@ class PaperTradingLoop:
     # DB persistence helpers
     # ------------------------------------------------------------------
     def _persist_setup(self, setup: Setup) -> None:
+        """Persist the Setup row + its frozen feature snapshot (Day 8).
+
+        The feature snapshot is the canonical anti-lookahead artifact —
+        the trade analyzer reloads it at close time so any feature-based
+        post-mortem reasons about exactly the values the strategy saw at
+        entry, not whatever ``build_features`` happens to produce later.
+        """
         try:
             with session_scope() as session:
                 existing = session.execute(
@@ -431,6 +566,15 @@ class PaperTradingLoop:
                 ).scalar_one_or_none()
                 if existing is not None:
                     return
+
+                snapshot_row = FeatureSnapshotRow(
+                    instrument=setup.instrument,
+                    ts=setup.timestamp,
+                    features=dict(setup.features),
+                )
+                session.add(snapshot_row)
+                session.flush()  # populate snapshot_row.id
+
                 row = SetupRow(
                     id=setup.id,
                     instrument=setup.instrument,
@@ -441,7 +585,7 @@ class PaperTradingLoop:
                     stop_price=setup.stop_price,
                     target_price=setup.target_price,
                     atr_at_entry=setup.atr_at_entry,
-                    feature_snapshot_id=None,
+                    feature_snapshot_id=snapshot_row.id,
                 )
                 session.add(row)
         except Exception as e:

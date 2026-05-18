@@ -66,6 +66,10 @@ class PaperExecutor(Executor):
         self.fills = fills_model
         self.kill_switch = kill_switch or KillSwitch()
         self._open_paper_id: Optional[str] = None
+        # Day 8: post-trade analysis hook needs the closed_trades.id of
+        # the most recent close so it can join setups + predictions
+        # without re-querying by (setup_id, exit_ts).
+        self.last_closed_trade_id: Optional[str] = None
         self.log = get_logger("execution.paper_executor")
 
     # ---------------- Order submission ------------------------------------
@@ -166,6 +170,7 @@ class PaperExecutor(Executor):
         )
 
         paper_id = self._open_paper_id
+        closed_id: Optional[str] = None
         if paper_id is None:
             self.log.warning(
                 "paper.close_without_open_id",
@@ -173,8 +178,9 @@ class PaperExecutor(Executor):
                 detail="Portfolio had open position but no DB paper_trade_id",
             )
         else:
-            self._persist_close(paper_trade_id=paper_id, record=record)
+            closed_id = self._persist_close(paper_trade_id=paper_id, record=record)
         self._open_paper_id = None
+        self.last_closed_trade_id = closed_id
 
         self.log.info(
             "paper.closed",
@@ -207,7 +213,7 @@ class PaperExecutor(Executor):
 
     def _persist_close(
         self, *, paper_trade_id: str, record: ClosedTradeRecord
-    ) -> None:
+    ) -> str:
         with session_scope() as session:
             paper = session.execute(
                 select(PaperTradeRow).where(PaperTradeRow.id == paper_trade_id)
@@ -231,3 +237,5 @@ class PaperExecutor(Executor):
                 slippage=float(record.slippage),
             )
             session.add(closed)
+            session.flush()  # populate closed.id for the post-trade analysis hook.
+            return str(closed.id)

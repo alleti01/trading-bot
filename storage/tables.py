@@ -239,6 +239,101 @@ class ModelMetadata(Base):
     artifact_path: Mapped[str] = mapped_column(Text)
 
 
+class TradeAnalysis(Base):
+    """Per-trade structured post-mortem.
+
+    One row per closed trade. The full :class:`analysis.types.PostTradeAnalysis`
+    payload is JSON-serialized into ``analysis``; columns above it are
+    de-normalized so the EOD pattern miner / mistake report can run
+    without parsing every JSON blob.
+    """
+
+    __tablename__ = "trade_analyses"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    closed_trade_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("closed_trades.id"),
+        unique=True,
+        index=True,
+    )
+    setup_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("setups.id"), nullable=True, index=True
+    )
+    instrument: Mapped[str] = mapped_column(String(32), index=True)
+    strategy_name: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    direction: Mapped[str] = mapped_column(String(8))
+    entry_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    exit_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    result: Mapped[str] = mapped_column(String(16))  # win | loss | breakeven
+    net_pnl: Mapped[float] = mapped_column(Float)
+    r_multiple: Mapped[float] = mapped_column(Float, default=0.0)
+    model_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    risk_approved: Mapped[bool] = mapped_column(Boolean, default=True)
+    followed_plan: Mapped[bool] = mapped_column(Boolean, default=True)
+    exit_reason: Mapped[str] = mapped_column(String(32))
+    time_of_day_bucket: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    volatility_regime: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    market_regime: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    news_risk_level: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    mfe: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    mae: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    analysis: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=datetime.utcnow, index=True
+    )
+
+
+class TradeMistakeTag(Base):
+    """Many-to-one tags attached to a trade analysis.
+
+    A losing or weak trade can carry several tags. The analyzer is
+    deterministic; the LLM agent only summarizes the tags in plain
+    English — it does not assign new tags.
+    """
+
+    __tablename__ = "trade_mistake_tags"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_analysis_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("trade_analyses.id"), index=True
+    )
+    closed_trade_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("closed_trades.id"), index=True
+    )
+    tag: Mapped[str] = mapped_column(String(64), index=True)
+    detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class ImprovementSuggestion(Base):
+    """Proposed (and only proposed) improvements emitted by analysis.
+
+    The system NEVER auto-applies these. ``validation_status`` only
+    advances to ``backtested`` / ``approved`` / ``rejected`` through the
+    explicit retrain/promotion workflow — not from analysis itself.
+    """
+
+    __tablename__ = "improvement_suggestions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    suggestion_id: Mapped[str] = mapped_column(
+        String(36), unique=True, index=True, default=_uuid
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=datetime.utcnow, index=True
+    )
+    affected_strategy: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    affected_condition: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    reason: Mapped[str] = mapped_column(Text)
+    supporting_stats: Mapped[dict] = mapped_column(JSON)
+    expected_benefit: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    risk_of_overfitting: Mapped[str] = mapped_column(String(16), default="medium")
+    validation_status: Mapped[str] = mapped_column(
+        String(16), default="proposed", index=True
+    )  # proposed | backtested | approved | rejected
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
 class KillSwitchState(Base):
     """Persisted kill switch.
 

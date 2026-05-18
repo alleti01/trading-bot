@@ -149,13 +149,15 @@ def test_model_review_retrain_required_bool() -> None:
     assert parsed.retrain_recommended is False
 
 
-def test_agent_schemas_map_covers_all_five() -> None:
+def test_agent_schemas_map_covers_known_agents() -> None:
+    """The five Day-7 agents plus the Day-8 trade_analysis agent."""
     assert set(AGENT_SCHEMAS.keys()) == {
         "news",
         "risk_explainer",
         "trade_journal",
         "report",
         "model_review",
+        "trade_analysis",
     }
 
 

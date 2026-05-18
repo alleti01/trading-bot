@@ -34,6 +34,7 @@ from config.settings import Settings
 from notifications.notification_service import NotificationService
 from paper.loop import PaperTradingLoop
 from reports.daily_report import write_daily_report
+from reports.mistake_report import write_mistake_report
 from risk.kill_switch import KillSwitch
 from scheduler.market_hours import is_trading_day
 
@@ -249,6 +250,21 @@ class SchedulerService:
             self.log.error("scheduler.eod_failed", error=str(e))
             self.notifier.notify("system.error", kind="end_of_day", error=str(e))
             return
+
+        # Day 8: pattern miner + mistake report. Wrapped separately —
+        # nothing here should be able to take down the deterministic
+        # daily report we already wrote above.
+        try:
+            mistake_artifacts = write_mistake_report(self.settings, now=now)
+            self.notifier.notify(
+                "mistakes.summary",
+                md_path=str(mistake_artifacts.md_path),
+                json_path=str(mistake_artifacts.json_path),
+                n_proposed=mistake_artifacts.n_proposed,
+            )
+        except Exception as e:
+            self.log.error("scheduler.mistake_report_failed", error=str(e))
+            self.notifier.notify("system.error", kind="mistake_report", error=str(e))
 
         # Day 7: agent layer. Wrapped separately so a flaky LLM cannot
         # damage the deterministic EOD report path above.

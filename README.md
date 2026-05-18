@@ -32,6 +32,7 @@ crypto (BTC/etc.) that:
 | PAPER     | Live data → strategy → model → risk → simulator         | Day 5 ✓       |
 | Reports   | Per-session Markdown report + CSV trade journal        | Day 6 ✓       |
 | Agents    | LLM advisory agents (no execution access)              | Day 7 ✓       |
+| Analysis  | Per-trade analysis, mistake classification, retrain    | Day 8 ✓       |
 | LIVE      | **Locked.** Requires real adapter + opt-in flag         | Out of scope  |
 
 ## Architecture
@@ -100,6 +101,9 @@ python -m app.main --mode PAPER --smoke-daily-report
 
 # Day 7 — run the LLM agent orchestrator with a deterministic mock LLM
 python -m app.main --mode PAPER --smoke-agents
+
+# Day 8 — per-trade analysis + mistake classification + mistake report
+python -m app.main --mode PAPER --smoke-trade-analysis
 ```
 
 Each smoke run is deterministic and lands in well under a minute.
@@ -187,6 +191,68 @@ agent layer back into trading is the existing
 `OPENAI_API_KEY` in `.env`. Without those the orchestrator is a no-op
 and the bot behaves exactly as in Days 1–6. The smoke command always
 uses `MockLLMClient`, so it never makes a real network call.
+
+## Trade analysis & mistake learning (Day 8)
+
+After every closed trade the bot now runs a structured post-mortem and
+classifies mistakes deterministically. The system **learns through
+logging, validated retraining, and explicit promotion** — never through
+in-place edits to strategy code, risk caps, or the
+`CONFIDENCE_THRESHOLD`.
+
+Pipeline (per close):
+
+```
+PaperTradingLoop.close_position
+  → PostTradeAnalysisService.on_trade_closed
+       → TradeAnalyzer.analyze_closed_trade   # deterministic
+       → MistakeClassifier.classify          # rule-based, multiple tags
+       → persist trade_analyses + trade_mistake_tags
+       → reports/post_trade_report.py        # per-trade Markdown
+       → TradeAnalysisAgent (LLM, optional)  # plain-English narrative
+       → NotificationService.notify("trade.analysis", ...)
+```
+
+Pipeline (end-of-day, batch):
+
+```
+SchedulerService._safe_end_of_day
+  → reports/mistake_report.py
+       → PatternMiner.aggregate(...)
+       → ImprovementSuggester.propose(...)   # validation_status="proposed"
+       → persist_candidates(...)             # logged only, never auto-applied
+```
+
+Pipeline (operator-driven retraining + promotion):
+
+```
+python -m app.main --retrain-from-feedback   # build dataset + comparison report
+python -m app.main --promote-model VERSION   # only if PromotionDecision says so
+```
+
+Mistake tag enum (deterministic; tagged by `MistakeClassifier`):
+`false_positive` (model approved + lost materially),
+`low_confidence_trade`, `bad_orderflow_confirmation`,
+`orderflow_divergence`, `entered_during_chop`, `low_volume_trade`,
+`bad_time_of_day`, `high_volatility_spike`, `news_risk_trade`,
+`stop_too_tight`, `target_too_far`, `poor_risk_reward`,
+`strategy_conflict`, `slippage_loss`, `timeout_exit`, `rule_violation`,
+`unknown`.
+
+### Safety invariants
+
+- The classifier is the **single source of truth** for mistake tags.
+  The LLM agent only narrates — it cannot add or remove tags.
+- `ImprovementSuggester` writes rows with
+  `validation_status="proposed"`. **Never** automatic.
+- `analysis/promotion.py` returns a `PromotionDecision`; calling code
+  refuses to advance the model registry pointer unless every gate is
+  satisfied (expectancy, profit factor, max-drawdown, false-positive
+  rate, walk-forward stability).
+- All analysis steps are wrapped — a per-trade analysis or LLM failure
+  cannot break the trade-close path or the scheduler.
+- `agents/trade_analysis_agent.py` still passes
+  `tests/test_agent_isolation.py`: no `execution/` or `risk/` imports.
 
 ```bash
 # Production-ish (one-shot end-of-day):
@@ -287,6 +353,7 @@ To enable live trading later you must:
 |  5  | Paper executor, scheduler, Discord notifications            | ✓      |
 |  6  | Daily report + trade journal + scheduler EOD wiring         | ✓      |
 |  7  | LLM advisory agents (with strict schemas) + polish          | ✓      |
+|  8  | Trade analysis + mistake learning + retrain/promote workflow | ✓     |
 
 ## Project layout
 
@@ -304,9 +371,12 @@ risk/                   deterministic engine, kill switch, position sizing
 compliance/             generic + Tradeify-inspired rules
 execution/              base, paper executor, LIVE placeholders (refuse)
 agents/                 LLM advisory agents (schemas, no execution access)
+analysis/               post-trade analyzer, mistake classifier, pattern miner,
+                        improvement suggester, feedback dataset, promotion
 notifications/          Discord webhook + rate-limited dispatcher
 paper/                  PaperTradingLoop (Day 5)
-reports/                daily report, trade journal, backtest report
+reports/                daily report, trade journal, backtest report,
+                        per-trade post-mortem, daily mistake digest
 scheduler/              APScheduler service + market hours
 storage/                SQLAlchemy engine + ORM tables
 tests/                  pytest tests (220+ covering all the above)

@@ -34,6 +34,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from typing import Callable
+
 from app.logging_config import get_logger
 from backtesting.fills import FillsModel, make_fills_model
 from backtesting.metrics import BacktestMetrics, compute_metrics, daily_pnl_table
@@ -99,6 +101,7 @@ class BacktestEngine:
         starting_equity: float = 0.0,
         max_hold_bars: Optional[int] = None,
         timeframe: str = "1m",
+        on_trade_closed: Optional[Callable[[ClosedTradeRecord], None]] = None,
     ) -> None:
         self.settings = settings
         self.predictor = predictor
@@ -115,6 +118,12 @@ class BacktestEngine:
         )
         self.tz = ZoneInfo(settings.TIMEZONE)
         self.log = get_logger("backtesting.engine")
+        # Day 8: optional in-memory hook for backtest-only callers that
+        # want each closed trade as it lands. Defaults to a no-op so the
+        # backtester is unchanged for everyone else (including tests).
+        self._on_trade_closed: Callable[[ClosedTradeRecord], None] = (
+            on_trade_closed or (lambda _r: None)
+        )
 
     # ----------------------------------------------------------------------
     def run(
@@ -202,6 +211,17 @@ class BacktestEngine:
             result.equity_curve,
             starting_equity=self.portfolio.starting_equity,
         )
+
+        # Day 8: emit each closed trade to an optional in-memory hook.
+        # Backtest does not write closed_trades to the DB, so the
+        # PostTradeAnalysisService's DB-driven path does not apply here.
+        # Callers that want analysis on backtest results can adapt the
+        # records into ``PostTradeAnalysis`` directly via the hook.
+        for record in result.closed_trades:
+            try:
+                self._on_trade_closed(record)
+            except Exception as e:
+                self.log.warning("backtest.on_trade_closed_failed", error=str(e))
 
         self.log.info(
             "backtest.complete",

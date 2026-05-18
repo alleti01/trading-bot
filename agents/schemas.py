@@ -115,6 +115,32 @@ class ModelReviewOutput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 6. TradeAnalysisAgent (per closed trade)
+# ---------------------------------------------------------------------------
+AnalysisConfidence = Literal["low", "medium", "high"]
+
+
+class TradeAnalysisSummary(BaseModel):
+    """Plain-English narration of one :class:`PostTradeAnalysis`.
+
+    Strictly explanatory: the agent does not change a single mistake tag
+    (those come from the deterministic classifier) and does not propose
+    rule changes. ``review_notes`` are operator-facing reminders, not
+    instructions.
+    """
+
+    model_config = _StrictConfig
+
+    trade_id: str = Field(min_length=1, max_length=64)
+    headline: str = Field(min_length=1, max_length=200)
+    why_taken: str = Field(min_length=1, max_length=2000)
+    why_outcome: str = Field(min_length=1, max_length=2000)
+    mistake_summary: str = Field(min_length=1, max_length=2000)
+    review_notes: list[str] = Field(default_factory=list, max_length=10)
+    confidence_in_analysis: AnalysisConfidence = "medium"
+
+
+# ---------------------------------------------------------------------------
 # Wrapper persisted to ``agent_outputs``
 # ---------------------------------------------------------------------------
 class AgentResult(BaseModel):
@@ -147,4 +173,5 @@ AGENT_SCHEMAS: dict[str, type[BaseModel]] = {
     "trade_journal": TradeJournalNarrative,
     "report": ReportCommentary,
     "model_review": ModelReviewOutput,
+    "trade_analysis": TradeAnalysisSummary,
 }
