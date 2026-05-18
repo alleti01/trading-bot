@@ -49,6 +49,23 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Run a Day-4 backtest smoke pass against synthetic OHLCV.",
     )
     parser.add_argument(
+        "--smoke-paper",
+        action="store_true",
+        help="Run a Day-5 paper smoke pass: a few bar cycles against a synthetic feed, then exit.",
+    )
+    parser.add_argument(
+        "--paper-csv",
+        type=str,
+        default=None,
+        help="Path to an OHLCV CSV. When provided with --mode PAPER drives the paper loop via RollingCSVFeed.",
+    )
+    parser.add_argument(
+        "--paper-cycles",
+        type=int,
+        default=10,
+        help="Number of bar cycles for --smoke-paper (default 10).",
+    )
+    parser.add_argument(
         "--backtest-csv",
         type=str,
         default=None,
@@ -58,7 +75,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--model-name",
         type=str,
         default=None,
-        help="Optional model name in the registry to gate setups during backtest.",
+        help="Optional model name in the registry to gate setups (backtest + paper).",
     )
     parser.add_argument(
         "--model-version",
@@ -362,6 +379,111 @@ def _run_backtest_from_csv(
     )
 
 
+def _build_paper_feed(settings: Settings, args: argparse.Namespace, log):
+    """Resolve which incremental feed to use for paper mode."""
+    from data.market_data_service import RollingCSVFeed, SyntheticLiveFeed
+
+    csv_path = args.paper_csv or settings.PAPER_CSV_PATH
+    if csv_path:
+        log.info("paper.feed_csv", path=str(csv_path))
+        return RollingCSVFeed(
+            path=csv_path,
+            instrument=settings.INSTRUMENT,
+            timeframe="1m",
+            tz=settings.TIMEZONE,
+            window_bars=settings.ROLLING_WINDOW_BARS,
+        )
+    log.info("paper.feed_synthetic", note="No CSV configured; using SyntheticLiveFeed.")
+    return SyntheticLiveFeed(
+        instrument=settings.INSTRUMENT,
+        timeframe="1m",
+        tz=settings.TIMEZONE,
+        max_bars=max(2_000, settings.ROLLING_WINDOW_BARS * 2),
+        window_bars=settings.ROLLING_WINDOW_BARS,
+    )
+
+
+def _run_smoke_paper(settings: Settings, log, *, args: argparse.Namespace) -> int:
+    """Day-5 paper smoke: a few synchronous bar cycles, then exit."""
+    from notifications.notification_service import NotificationService
+    from paper.loop import build_paper_loop
+    from scheduler.service import SchedulerService
+    from sqlalchemy import func, select
+
+    from storage.db import session_scope
+    from storage.tables import ClosedTrade, Notification, PaperTrade, RiskBlock
+
+    notifier = NotificationService.from_settings(settings)
+    feed = _build_paper_feed(settings, args, log)
+    loop = build_paper_loop(
+        settings=settings,
+        feed=feed,
+        notifier=notifier,
+        model_name=args.model_name,
+        model_version=args.model_version,
+    )
+    service = SchedulerService(
+        settings=settings, loop=loop, notifier=notifier, blocking=False
+    )
+    cycles = max(1, int(args.paper_cycles or 10))
+    results = service.run_smoke_cycles(cycles)
+
+    new_bars = sum(1 for r in results if r.new_bar)
+    setups_seen = sum(r.setups_seen for r in results)
+    setups_filled = sum(r.setups_filled for r in results)
+    setups_blocked = sum(r.setups_risk_blocked for r in results)
+    setups_model_rejected = sum(r.setups_model_rejected for r in results)
+    exits = sum(r.exits for r in results)
+    errors = sum(len(r.errors) for r in results)
+
+    with session_scope() as session:
+        n_paper = session.execute(select(func.count(PaperTrade.id))).scalar() or 0
+        n_closed = session.execute(select(func.count(ClosedTrade.id))).scalar() or 0
+        n_blocks = session.execute(select(func.count(RiskBlock.id))).scalar() or 0
+        n_notifs = session.execute(select(func.count(Notification.id))).scalar() or 0
+
+    log.info(
+        "smoke.paper.summary",
+        cycles=cycles,
+        new_bars=new_bars,
+        setups_seen=setups_seen,
+        setups_filled=setups_filled,
+        setups_blocked=setups_blocked,
+        setups_model_rejected=setups_model_rejected,
+        exits=exits,
+        errors=errors,
+        db_paper_trades=n_paper,
+        db_closed_trades=n_closed,
+        db_risk_blocks=n_blocks,
+        db_notifications=n_notifs,
+    )
+    log.info("smoke.complete", message="Day 5 paper smoke run passed.")
+    return 0
+
+
+def _run_paper_forever(settings: Settings, log, *, args: argparse.Namespace) -> int:
+    """Day-5 PAPER mode: run the scheduler forever (blocking)."""
+    from notifications.notification_service import NotificationService
+    from paper.loop import build_paper_loop
+    from scheduler.service import SchedulerService
+
+    notifier = NotificationService.from_settings(settings)
+    feed = _build_paper_feed(settings, args, log)
+    loop = build_paper_loop(
+        settings=settings,
+        feed=feed,
+        notifier=notifier,
+        model_name=args.model_name,
+        model_version=args.model_version,
+    )
+    service = SchedulerService(
+        settings=settings, loop=loop, notifier=notifier, blocking=True
+    )
+    log.info("paper.run_forever", note="Starting blocking scheduler. Ctrl-C to stop.")
+    service.run_forever()
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
 
@@ -407,7 +529,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.smoke_backtest:
         return _run_smoke_backtest(settings, log)
 
-    # Real mode runners arrive on Days 3–5. For now just say so and exit.
+    if args.smoke_paper:
+        return _run_smoke_paper(settings, log, args=args)
+
     if settings.MODE == "TRAIN":
         log.warning("mode.not_implemented", mode="TRAIN", note="Day 3 deliverable")
         return 0
@@ -426,8 +550,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         return 0
     if settings.MODE == "PAPER":
-        log.warning("mode.not_implemented", mode="PAPER", note="Day 5 deliverable")
-        return 0
+        return _run_paper_forever(settings, log, args=args)
     # LIVE has already been refused by the settings validator if not configured.
     log.warning("mode.live_unsupported", note="No live adapter implemented in this MVP.")
     return 0

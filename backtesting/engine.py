@@ -38,6 +38,7 @@ from app.logging_config import get_logger
 from backtesting.fills import FillsModel, make_fills_model
 from backtesting.metrics import BacktestMetrics, compute_metrics, daily_pnl_table
 from backtesting.portfolio import ClosedTradeRecord, Portfolio
+from backtesting.trade_management import apply_exit, check_exit
 from config.instruments import get_instrument
 from config.settings import Settings
 from models.predictor import Predictor
@@ -233,88 +234,25 @@ class BacktestEngine:
 
         ts_py = ts.to_pydatetime() if isinstance(ts, pd.Timestamp) else ts
 
-        # Forced flat (futures): close before configured flat time. We use
-        # local-tz comparison so DST is handled.
-        local_t = ts_py.astimezone(self.tz).time()
-        if (
-            self.settings.MARKET_TYPE == "futures"
-            and local_t >= self.settings.force_flat_time()
-        ):
-            exit_price = float(bar["open"])  # close at the bar's open, conservative
-            costs = self.fills.exit(
-                direction=pos.direction, raw_price=exit_price, quantity=pos.quantity
-            )
-            self.portfolio.close(
-                ts=ts_py,
-                exit_price=costs.fill_price,
-                exit_reason="forced_flat",
-                commission=costs.commission,
-                slippage=costs.slippage,
-                bar_index=bar_index,
-            )
+        decision = check_exit(
+            position=pos,
+            bar=bar,
+            bar_index=bar_index,
+            bar_ts=ts_py,
+            max_hold_bars=self.max_hold_bars,
+            force_flat_time=self.settings.force_flat_time(),
+            market_type=self.settings.MARKET_TYPE,
+            tz=self.tz,
+        )
+        if decision is None:
             return
-
-        h = float(bar["high"])
-        lo = float(bar["low"])
-        is_long = pos.direction == "long"
-        tp_hit = (h >= pos.target_price) if is_long else (lo <= pos.target_price)
-        sl_hit = (lo <= pos.stop_price) if is_long else (h >= pos.stop_price)
-
-        # Same-bar ambiguity → SL first.
-        if tp_hit and sl_hit:
-            costs = self.fills.exit(
-                direction=pos.direction, raw_price=pos.stop_price, quantity=pos.quantity
-            )
-            self.portfolio.close(
-                ts=ts_py,
-                exit_price=costs.fill_price,
-                exit_reason="sl",
-                commission=costs.commission,
-                slippage=costs.slippage,
-                bar_index=bar_index,
-            )
-            return
-        if sl_hit:
-            costs = self.fills.exit(
-                direction=pos.direction, raw_price=pos.stop_price, quantity=pos.quantity
-            )
-            self.portfolio.close(
-                ts=ts_py,
-                exit_price=costs.fill_price,
-                exit_reason="sl",
-                commission=costs.commission,
-                slippage=costs.slippage,
-                bar_index=bar_index,
-            )
-            return
-        if tp_hit:
-            costs = self.fills.exit(
-                direction=pos.direction, raw_price=pos.target_price, quantity=pos.quantity
-            )
-            self.portfolio.close(
-                ts=ts_py,
-                exit_price=costs.fill_price,
-                exit_reason="tp",
-                commission=costs.commission,
-                slippage=costs.slippage,
-                bar_index=bar_index,
-            )
-            return
-
-        # Time-out.
-        if pos.bars_held(bar_index) >= self.max_hold_bars:
-            exit_price = float(bar["close"])
-            costs = self.fills.exit(
-                direction=pos.direction, raw_price=exit_price, quantity=pos.quantity
-            )
-            self.portfolio.close(
-                ts=ts_py,
-                exit_price=costs.fill_price,
-                exit_reason="time",
-                commission=costs.commission,
-                slippage=costs.slippage,
-                bar_index=bar_index,
-            )
+        apply_exit(
+            portfolio=self.portfolio,
+            fills=self.fills,
+            decision=decision,
+            ts=ts_py,
+            bar_index=bar_index,
+        )
 
     def _consider_entry(
         self,

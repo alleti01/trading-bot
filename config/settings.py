@@ -80,6 +80,12 @@ class Settings(BaseSettings):
     # ---- Notifications -------------------------------------------------
     DISCORD_WEBHOOK_URL: Optional[SecretStr] = None
 
+    # ---- Paper service (Day 5) ----------------------------------------
+    BAR_INTERVAL_SECONDS: int = Field(default=60, ge=1)
+    ROLLING_WINDOW_BARS: int = Field(default=500, ge=50)
+    PAPER_CSV_PATH: Optional[str] = None
+    HEARTBEAT_LOCAL_TIME: str = "08:00"
+
     # ---- Storage -------------------------------------------------------
     DATABASE_URL: str = "sqlite:///./data/bot.db"
 
@@ -97,7 +103,12 @@ class Settings(BaseSettings):
     # ----------------------------------------------------------------------
     # Validators
     # ----------------------------------------------------------------------
-    @field_validator("TRADING_WINDOW_START", "TRADING_WINDOW_END", "FORCE_FLAT_TIME")
+    @field_validator(
+        "TRADING_WINDOW_START",
+        "TRADING_WINDOW_END",
+        "FORCE_FLAT_TIME",
+        "HEARTBEAT_LOCAL_TIME",
+    )
     @classmethod
     def _validate_time(cls, v: str) -> str:
         try:
