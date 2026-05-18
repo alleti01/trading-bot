@@ -32,7 +32,7 @@ from app.logging_config import get_logger
 from config.settings import Settings
 from notifications.notification_service import NotificationService
 from paper.loop import PaperTradingLoop
-from reports.daily_report import generate_end_of_day_summary
+from reports.daily_report import write_daily_report
 from risk.kill_switch import KillSwitch
 from scheduler.market_hours import is_trading_day
 
@@ -216,8 +216,16 @@ class SchedulerService:
     def _safe_end_of_day(self) -> None:
         try:
             now = datetime.now(tz=timezone.utc)
-            summary = generate_end_of_day_summary(self.settings, now=now)
-            self.notifier.notify("eod.summary", **summary.to_payload())
+            artifacts = write_daily_report(self.settings, now=now)
+            self.notifier.notify(
+                "eod.summary",
+                **artifacts.summary.to_payload(),
+                md_path=str(artifacts.md_path),
+                json_path=str(artifacts.json_path),
+                journal_path=(
+                    str(artifacts.journal_path) if artifacts.journal_path else ""
+                ),
+            )
         except Exception as e:
             self.log.error("scheduler.eod_failed", error=str(e))
             self.notifier.notify("system.error", kind="end_of_day", error=str(e))

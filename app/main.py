@@ -54,6 +54,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Run a Day-5 paper smoke pass: a few bar cycles against a synthetic feed, then exit.",
     )
     parser.add_argument(
+        "--smoke-daily-report",
+        action="store_true",
+        help="Day-6 smoke: synthesize a few closed trades + risk blocks, write the daily Markdown report and CSV trade journal, then exit.",
+    )
+    parser.add_argument(
         "--paper-csv",
         type=str,
         default=None,
@@ -461,6 +466,72 @@ def _run_smoke_paper(settings: Settings, log, *, args: argparse.Namespace) -> in
     return 0
 
 
+def _run_smoke_daily_report(settings: Settings, log) -> int:
+    """Day-6 smoke: seed a handful of synthetic closed trades + risk blocks
+    and run the full daily report writer end-to-end."""
+    from datetime import datetime, timedelta, timezone
+
+    from reports.daily_report import write_daily_report
+    from storage.db import session_scope
+    from storage.tables import ClosedTrade, RiskBlock
+
+    now = datetime.now(tz=timezone.utc)
+
+    # Seed a few trades + a risk block for *today's* session date.
+    from scheduler.market_hours import session_date
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(settings.TIMEZONE)
+    sd = session_date(now, settings)
+    base_local = datetime.combine(sd, datetime.min.time(), tzinfo=tz).replace(hour=10)
+
+    seeds = [
+        ("long", 4500.0, 4504.0, "tp", 20.0),
+        ("long", 4504.0, 4502.0, "sl", -10.0),
+        ("short", 4505.0, 4501.0, "tp", 20.0),
+    ]
+    with session_scope() as session:
+        for i, (direction, entry, exit_, reason, pnl) in enumerate(seeds):
+            entry_ts = (base_local + timedelta(minutes=10 * i)).astimezone(timezone.utc)
+            exit_ts = entry_ts + timedelta(minutes=4)
+            session.add(
+                ClosedTrade(
+                    paper_trade_id=None,
+                    setup_id=f"smoke-setup-{i}",
+                    instrument=settings.INSTRUMENT,
+                    direction=direction,
+                    quantity=1.0,
+                    entry_ts=entry_ts,
+                    entry_price=entry,
+                    exit_ts=exit_ts,
+                    exit_price=exit_,
+                    exit_reason=reason,
+                    pnl=pnl,
+                    commission=0.50,
+                    slippage=0.0,
+                )
+            )
+        session.add(
+            RiskBlock(
+                setup_id="smoke-setup-blocked",
+                ts=base_local.astimezone(timezone.utc),
+                rule="max_trades_per_day",
+                reason="seeded for smoke run",
+            )
+        )
+
+    artifacts = write_daily_report(settings, now=now)
+    log.info(
+        "smoke.daily_report.summary",
+        md_path=str(artifacts.md_path),
+        json_path=str(artifacts.json_path),
+        journal_path=str(artifacts.journal_path) if artifacts.journal_path else None,
+        **artifacts.summary.to_payload(),
+    )
+    log.info("smoke.complete", message="Day 6 daily-report smoke run passed.")
+    return 0
+
+
 def _run_paper_forever(settings: Settings, log, *, args: argparse.Namespace) -> int:
     """Day-5 PAPER mode: run the scheduler forever (blocking)."""
     from notifications.notification_service import NotificationService
@@ -531,6 +602,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.smoke_paper:
         return _run_smoke_paper(settings, log, args=args)
+
+    if args.smoke_daily_report:
+        return _run_smoke_daily_report(settings, log)
 
     if settings.MODE == "TRAIN":
         log.warning("mode.not_implemented", mode="TRAIN", note="Day 3 deliverable")
