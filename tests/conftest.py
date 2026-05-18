@@ -1,0 +1,62 @@
+"""Shared pytest fixtures.
+
+We deliberately make every test load settings from a clean environment so
+that a stray ``.env`` in the working directory cannot influence results.
+"""
+
+from __future__ import annotations
+
+import os
+from collections.abc import Iterator
+
+import pytest
+
+
+_ENV_KEYS_TO_RESET = {
+    "MODE",
+    "LIVE_ADAPTER_CONFIRMED",
+    "INSTRUMENT",
+    "MARKET_TYPE",
+    "TIMEZONE",
+    "DATABASE_URL",
+    "TRADING_WINDOW_START",
+    "TRADING_WINDOW_END",
+    "FORCE_FLAT_TIME",
+    "MAX_DAILY_LOSS",
+    "MAX_DAILY_PROFIT",
+    "MAX_TRADES_PER_DAY",
+    "MAX_POSITION_SIZE",
+    "RISK_PER_TRADE",
+    "CONFIDENCE_THRESHOLD",
+    "SLIPPAGE_TICKS",
+    "COMMISSION_PER_CONTRACT",
+    "CONSISTENCY_LIMIT_PERCENT",
+    "ENABLE_LLM_AGENTS",
+    "LOG_LEVEL",
+    "LOG_JSON",
+}
+
+
+@pytest.fixture(autouse=True)
+def _isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Iterator[None]:
+    # Wipe any env vars that could pollute Settings construction.
+    for key in _ENV_KEYS_TO_RESET:
+        monkeypatch.delenv(key, raising=False)
+
+    # Use a temp DB and prevent reading a real .env.
+    db_path = tmp_path / "test.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    # Pydantic-settings still tries to read .env from cwd; redirect to /dev/null.
+    monkeypatch.chdir(tmp_path)
+
+    # Reset cached singletons in app modules.
+    from config import settings as cfg
+    from storage import db as db_mod
+
+    cfg._settings = None
+    db_mod.reset_engine_for_tests()
+
+    yield
+
+    cfg._settings = None
+    db_mod.reset_engine_for_tests()

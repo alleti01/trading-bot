@@ -1,0 +1,35 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# --- Virtualenvs ---
+.venv/
+venv/
+env/
+
+# --- Test / type / lint caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Project artifacts ---
+.env
+.env.local
+data/*.db
+data/*.db-journal
+data/historical/
+data/models/
+data/reports/
+logs/
+
+# --- OS / editors ---
+.DS_Store
+.idea/
+.vscode/
+*.swp

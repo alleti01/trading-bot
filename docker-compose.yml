@@ -1,0 +1,12 @@
+services:
+  bot:
+    build: .
+    container_name: tradeify-bot
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped
+    # Override the default Day-1 dry-run command once a real mode runner exists:
+    # command: ["python", "-m", "app.main", "--mode", "PAPER"]
