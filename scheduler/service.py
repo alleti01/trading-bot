@@ -28,6 +28,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
+from agents.orchestrator import AgentOrchestrator
 from app.logging_config import get_logger
 from config.settings import Settings
 from notifications.notification_service import NotificationService
@@ -52,11 +53,13 @@ class SchedulerService:
         notifier: NotificationService,
         kill_switch: Optional[KillSwitch] = None,
         blocking: bool = True,
+        orchestrator: Optional[AgentOrchestrator] = None,
     ) -> None:
         self.settings = settings
         self.loop = loop
         self.notifier = notifier
         self.kill_switch = kill_switch or KillSwitch()
+        self.orchestrator = orchestrator
         self.log = get_logger("scheduler.service")
         self._stop_event = threading.Event()
 
@@ -71,6 +74,7 @@ class SchedulerService:
     def _add_jobs(self) -> None:
         flat_time: time = self.settings.force_flat_time()
         heartbeat_t = time.fromisoformat(self.settings.HEARTBEAT_LOCAL_TIME)
+        news_t = time.fromisoformat(self.settings.NEWS_CHECK_LOCAL_TIME)
 
         self.scheduler.add_job(
             self._safe_bar_cycle,
@@ -114,6 +118,21 @@ class SchedulerService:
             replace_existing=True,
             max_instances=1,
         )
+        # Optional pre-session NewsAgent run. Only registered when an
+        # orchestrator is wired in *and* agents are enabled — otherwise
+        # the job is a no-op anyway.
+        if self.orchestrator is not None and self.settings.ENABLE_LLM_AGENTS:
+            self.scheduler.add_job(
+                self._safe_pre_session_news,
+                trigger=CronTrigger(
+                    hour=news_t.hour,
+                    minute=news_t.minute,
+                    timezone=self.settings.TIMEZONE,
+                ),
+                id="pre_session_news",
+                replace_existing=True,
+                max_instances=1,
+            )
 
     def _on_startup(self) -> None:
         ks = self.kill_switch.snapshot()
@@ -229,6 +248,29 @@ class SchedulerService:
         except Exception as e:
             self.log.error("scheduler.eod_failed", error=str(e))
             self.notifier.notify("system.error", kind="end_of_day", error=str(e))
+            return
+
+        # Day 7: agent layer. Wrapped separately so a flaky LLM cannot
+        # damage the deterministic EOD report path above.
+        if self.orchestrator is None or not self.settings.AGENTS_RUN_AT_EOD:
+            return
+        try:
+            self.orchestrator.run_end_of_day(
+                now=now,
+                daily_md_path=artifacts.md_path,
+            )
+        except Exception as e:
+            self.log.error("scheduler.agents_failed", error=str(e))
+            self.notifier.notify("system.error", kind="agents_eod", error=str(e))
+
+    def _safe_pre_session_news(self) -> None:
+        if self.orchestrator is None:
+            return
+        try:
+            self.orchestrator.run_pre_session_news(now=datetime.now(tz=timezone.utc))
+        except Exception as e:
+            self.log.error("scheduler.pre_session_news_failed", error=str(e))
+            self.notifier.notify("system.error", kind="pre_session_news", error=str(e))
 
     def _safe_heartbeat(self) -> None:
         try:

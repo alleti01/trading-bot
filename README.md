@@ -1,9 +1,10 @@
 # Tradeify-Style AI Trading Bot — MVP
 
-> **Status:** Days 1–6 of the build plan complete. The bot can now run in
-> `BACKTEST`, `TRAIN` (smoke), and `PAPER` mode end-to-end, write per-session
-> Markdown reports + CSV trade journals, and ship Discord alerts. LLM advisory
-> agents are Day 7. Live trading remains explicitly out of scope.
+> **Status:** Days 1–7 of the build plan complete — the one-week MVP is
+> done. The bot runs in `BACKTEST`, `TRAIN` (smoke), and `PAPER` mode end-
+> to-end, writes per-session Markdown reports + CSV trade journals, ships
+> Discord alerts, and runs five advisory LLM agents at end-of-day. Live
+> trading remains explicitly out of scope.
 >
 > **Live trading is disabled.** This repo refuses to boot in `LIVE` mode
 > unless both (a) `LIVE_ADAPTER_CONFIRMED=true` and (b) a real
@@ -30,7 +31,7 @@ crypto (BTC/etc.) that:
 | TRAIN     | Label setups, train baseline + boosted models          | Day 3 ✓       |
 | PAPER     | Live data → strategy → model → risk → simulator         | Day 5 ✓       |
 | Reports   | Per-session Markdown report + CSV trade journal        | Day 6 ✓       |
-| Agents    | LLM advisory agents (no execution access)              | Day 7         |
+| Agents    | LLM advisory agents (no execution access)              | Day 7 ✓       |
 | LIVE      | **Locked.** Requires real adapter + opt-in flag         | Out of scope  |
 
 ## Architecture
@@ -96,6 +97,9 @@ python -m app.main --mode PAPER --smoke-paper --paper-cycles 50
 
 # Day 6 — render a daily Markdown report + CSV trade journal
 python -m app.main --mode PAPER --smoke-daily-report
+
+# Day 7 — run the LLM agent orchestrator with a deterministic mock LLM
+python -m app.main --mode PAPER --smoke-agents
 ```
 
 Each smoke run is deterministic and lands in well under a minute.
@@ -152,6 +156,47 @@ attempt is persisted to the `notifications` table for audit.
 Webhook empty? The service falls back to log-only mode and still records
 each "attempt" so the audit trail stays consistent.
 
+## LLM advisory agents (Day 7)
+
+Five agents run after the deterministic daily report writes its
+artifacts. They are **read-only**: they cannot place trades, change risk
+limits, or modify model thresholds. The only behavioural bridge from the
+agent layer back into trading is the existing
+`risk_engine.evaluate(..., high_risk_news_window=…)` flag, which can
+**only block** entries — never approve them.
+
+| Agent              | Schema (Pydantic)        | Purpose                                                              |
+|--------------------|--------------------------|----------------------------------------------------------------------|
+| `NewsAgent`        | `NewsAssessment`         | Macro/news risk; sets the `high_risk_window` flag block-only.        |
+| `RiskExplainerAgent` | `RiskExplainerOutput`  | Plain-English explanations of today's risk blocks.                   |
+| `TradeJournalAgent` | `TradeJournalNarrative` | Highlights / mistakes / lessons from today's trades.                 |
+| `ReportAgent`      | `ReportCommentary`       | Headline + bullets appended to the daily Markdown.                   |
+| `ModelReviewAgent` | `ModelReviewOutput`      | Calibration / drift commentary; advisory `retrain_recommended` only. |
+
+**Safety guarantees enforced by code + tests:**
+
+- `agents/` may not import `execution/` or `risk/` (`tests/test_agent_isolation.py`).
+- Every output is validated against a frozen `extra="forbid"` schema; a
+  parse or validation failure is persisted as `agent_outputs` with
+  `schema_valid=False` and the bot keeps running.
+- Notification or LLM failures never crash the scheduler or paper loop.
+- Pre-session `NewsAgent` failures **keep** the previous high-risk flag
+  rather than silently re-enabling trading.
+
+**Running for real:** set `ENABLE_LLM_AGENTS=true` and provide
+`OPENAI_API_KEY` in `.env`. Without those the orchestrator is a no-op
+and the bot behaves exactly as in Days 1–6. The smoke command always
+uses `MockLLMClient`, so it never makes a real network call.
+
+```bash
+# Production-ish (one-shot end-of-day):
+ENABLE_LLM_AGENTS=true OPENAI_API_KEY=sk-... python -m app.main --mode PAPER --smoke-agents
+
+# Forever paper service: agents run after each EOD report and the
+# pre-session NewsAgent runs daily at NEWS_CHECK_LOCAL_TIME.
+ENABLE_LLM_AGENTS=true OPENAI_API_KEY=sk-... python -m app.main --mode PAPER
+```
+
 ## Docker
 
 ```bash
@@ -178,6 +223,12 @@ vars). See `.env.example` for the full list with comments. Key knobs:
 - `PAPER_CSV_PATH` — optional CSV replayed by the paper service.
 - `HEARTBEAT_LOCAL_TIME` — daily Discord heartbeat (default `08:00`).
 - `REPORTS_DIR` — where Markdown + JSON + CSV reports land.
+- `ENABLE_LLM_AGENTS` — Day 7 master switch (default `false`).
+- `OPENAI_API_KEY` — required when agents are enabled.
+- `LLM_MODEL` — OpenAI chat model (default `gpt-4o-mini`).
+- `LLM_TIMEOUT_SECONDS` — per-call timeout (default 30).
+- `AGENTS_RUN_AT_EOD` — whether the EOD scheduler job triggers the agents.
+- `NEWS_CHECK_LOCAL_TIME` — pre-session NewsAgent cron time (default `09:25`).
 
 ## Adding historical CSV data
 
@@ -196,15 +247,19 @@ configured `TIMEZONE` on load.
 .venv/bin/python -m pytest -q
 ```
 
-Currently 220+ tests covering: settings + LIVE lockout, candles, CSV
+Currently 260+ tests covering: settings + LIVE lockout, candles, CSV
 loading, indicators, feature builder + leakage, strategy contract, TP/SL
 labeling, time-split + walk-forward, predictor + drift, model registry,
 fills, position sizing, risk engine, kill switch, portfolio, backtest
 engine + accounting, compliance, paper executor, paper loop end-to-end,
 shared trade-management exits, market-hour predicates, scheduler
 behavior, daily report content, trade-journal CSV schema, Discord rate
-limiting, notification persistence, model-failure safety, and the
-`agents/` ↔ `execution/`/`risk/` import-isolation invariant.
+limiting, notification persistence, model-failure safety, agent schema
+strictness, LLM-client gating + mock dispatch, agent parse-failure
+handling, orchestrator persistence + per-agent failure isolation,
+pre-session-news flag persistence on failure, the NewsAgent → paper-loop
+high-risk-news block-only chain, and the `agents/` ↔
+`execution/`/`risk/` import-isolation invariant.
 
 ## Live trading — explicitly out of scope
 
@@ -231,7 +286,7 @@ To enable live trading later you must:
 |  4  | Backtester, fills/commissions, risk engine, compliance      | ✓      |
 |  5  | Paper executor, scheduler, Discord notifications            | ✓      |
 |  6  | Daily report + trade journal + scheduler EOD wiring         | ✓      |
-|  7  | LLM advisory agents (with strict schemas) + polish          | —      |
+|  7  | LLM advisory agents (with strict schemas) + polish          | ✓      |
 
 ## Project layout
 

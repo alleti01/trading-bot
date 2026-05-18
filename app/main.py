@@ -59,6 +59,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Day-6 smoke: synthesize a few closed trades + risk blocks, write the daily Markdown report and CSV trade journal, then exit.",
     )
     parser.add_argument(
+        "--smoke-agents",
+        action="store_true",
+        help="Day-7 smoke: seed trades + risk blocks, build daily report, run agent orchestrator with MockLLMClient, persist to agent_outputs, exit.",
+    )
+    parser.add_argument(
         "--paper-csv",
         type=str,
         default=None,
@@ -534,11 +539,13 @@ def _run_smoke_daily_report(settings: Settings, log) -> int:
 
 def _run_paper_forever(settings: Settings, log, *, args: argparse.Namespace) -> int:
     """Day-5 PAPER mode: run the scheduler forever (blocking)."""
+    from agents.orchestrator import build_orchestrator
     from notifications.notification_service import NotificationService
     from paper.loop import build_paper_loop
     from scheduler.service import SchedulerService
 
     notifier = NotificationService.from_settings(settings)
+    orchestrator = build_orchestrator(settings, notifier=notifier)
     feed = _build_paper_feed(settings, args, log)
     loop = build_paper_loop(
         settings=settings,
@@ -546,12 +553,120 @@ def _run_paper_forever(settings: Settings, log, *, args: argparse.Namespace) -> 
         notifier=notifier,
         model_name=args.model_name,
         model_version=args.model_version,
+        high_risk_news_fn=orchestrator.high_risk_news_active,
     )
     service = SchedulerService(
-        settings=settings, loop=loop, notifier=notifier, blocking=True
+        settings=settings,
+        loop=loop,
+        notifier=notifier,
+        blocking=True,
+        orchestrator=orchestrator,
     )
-    log.info("paper.run_forever", note="Starting blocking scheduler. Ctrl-C to stop.")
+    log.info(
+        "paper.run_forever",
+        note="Starting blocking scheduler. Ctrl-C to stop.",
+        agents_enabled=settings.ENABLE_LLM_AGENTS,
+    )
     service.run_forever()
+    return 0
+
+
+def _run_smoke_agents(settings: Settings, log) -> int:
+    """Day-7 smoke: seed trades, build report, run orchestrator with MockLLMClient.
+
+    Forces a mock LLM client regardless of ``ENABLE_LLM_AGENTS`` so the
+    smoke run never makes a real network call. Asserts every agent
+    produced a schema-valid output.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import func, select
+    from zoneinfo import ZoneInfo
+
+    from agents.llm_client import MockLLMClient
+    from agents.orchestrator import AgentOrchestrator
+    from notifications.notification_service import NotificationService
+    from reports.daily_report import write_daily_report
+    from scheduler.market_hours import session_date
+    from storage.db import session_scope
+    from storage.tables import AgentOutput, ClosedTrade, RiskBlock
+
+    notifier = NotificationService(discord=None)  # log-only
+
+    now = datetime.now(tz=timezone.utc)
+    tz = ZoneInfo(settings.TIMEZONE)
+    sd = session_date(now, settings)
+    base_local = datetime.combine(sd, datetime.min.time(), tzinfo=tz).replace(hour=10)
+
+    seeds = [
+        ("long", 4500.0, 4504.0, "tp", 20.0),
+        ("long", 4504.0, 4502.0, "sl", -10.0),
+        ("short", 4505.0, 4501.0, "tp", 20.0),
+    ]
+    with session_scope() as session:
+        for i, (direction, entry, exit_, reason, pnl) in enumerate(seeds):
+            entry_ts = (base_local + timedelta(minutes=10 * i)).astimezone(timezone.utc)
+            exit_ts = entry_ts + timedelta(minutes=4)
+            session.add(
+                ClosedTrade(
+                    paper_trade_id=None,
+                    setup_id=f"smoke-agent-{i}",
+                    instrument=settings.INSTRUMENT,
+                    direction=direction,
+                    quantity=1.0,
+                    entry_ts=entry_ts,
+                    entry_price=entry,
+                    exit_ts=exit_ts,
+                    exit_price=exit_,
+                    exit_reason=reason,
+                    pnl=pnl,
+                    commission=0.50,
+                    slippage=0.0,
+                )
+            )
+        session.add(
+            RiskBlock(
+                setup_id="smoke-agent-blocked",
+                ts=base_local.astimezone(timezone.utc),
+                rule="max_trades_per_day",
+                reason="seeded for agents smoke",
+            )
+        )
+
+    artifacts = write_daily_report(settings, now=now)
+
+    mock_llm = MockLLMClient()
+    orchestrator = AgentOrchestrator(settings, llm=mock_llm, notifier=notifier)
+    result = orchestrator.run_end_of_day(now=now, daily_md_path=artifacts.md_path)
+
+    with session_scope() as session:
+        n_outputs = session.execute(select(func.count(AgentOutput.id))).scalar() or 0
+        n_valid_db = (
+            session.execute(
+                select(func.count(AgentOutput.id)).where(
+                    AgentOutput.schema_valid.is_(True)
+                )
+            ).scalar()
+            or 0
+        )
+
+    log.info(
+        "smoke.agents.summary",
+        n_agents=result.n_total(),
+        n_valid=result.n_valid(),
+        high_risk_news=result.high_risk_news,
+        md_path=str(artifacts.md_path),
+        appended_md_path=(
+            str(result.appended_md_path) if result.appended_md_path else None
+        ),
+        db_agent_outputs=n_outputs,
+        db_agent_outputs_valid=n_valid_db,
+    )
+    log.info(
+        "smoke.complete",
+        message="Day 7 agents smoke run passed.",
+        note="MockLLMClient was used; production needs ENABLE_LLM_AGENTS=true + OPENAI_API_KEY.",
+    )
     return 0
 
 
@@ -605,6 +720,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.smoke_daily_report:
         return _run_smoke_daily_report(settings, log)
+
+    if args.smoke_agents:
+        return _run_smoke_agents(settings, log)
 
     if settings.MODE == "TRAIN":
         log.warning("mode.not_implemented", mode="TRAIN", note="Day 3 deliverable")

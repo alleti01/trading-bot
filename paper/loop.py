@@ -27,7 +27,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Optional, Protocol
+from typing import Any, Callable, Optional, Protocol
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -98,6 +98,7 @@ class PaperTradingLoop:
         executor: Optional[PaperExecutor] = None,
         kill_switch: Optional[KillSwitch] = None,
         max_hold_bars: Optional[int] = None,
+        high_risk_news_fn: Optional[Callable[[], bool]] = None,
     ) -> None:
         self.settings = settings
         self.feed = feed
@@ -120,6 +121,9 @@ class PaperTradingLoop:
         self.risk_config = RiskConfig.from_settings(settings)
         self.tz = ZoneInfo(settings.TIMEZONE)
         self.max_hold_bars = int(max_hold_bars or settings.MAX_HOLD_BARS)
+        # Day 7: agent-driven news risk window. Default callable always
+        # returns False so the loop is decoupled from the agents module.
+        self._high_risk_news_fn: Callable[[], bool] = high_risk_news_fn or (lambda: False)
 
         self.trading_enabled: bool = predictor is not None or True  # default-on
         self._bar_index = 0
@@ -346,13 +350,21 @@ class PaperTradingLoop:
                 result.setups_model_rejected += 1
                 return
 
-        # Risk engine.
+        # Risk engine. The high-risk news flag is *block-only* — the
+        # NewsAgent (or any other source) can flip it via the callback,
+        # but the engine remains authoritative; agents cannot approve.
+        try:
+            high_risk_news = bool(self._high_risk_news_fn())
+        except Exception as e:
+            self.log.warning("loop.news_flag_failed", error=str(e))
+            high_risk_news = False
         decision = evaluate(
             setup,
             self.portfolio,
             self.risk_config,
             now,
             kill_switch_tripped=self.kill_switch.is_tripped(),
+            high_risk_news_window=high_risk_news,
         )
         if not decision.allowed:
             self._persist_risk_block(setup, decision, now)
@@ -483,6 +495,7 @@ def build_paper_loop(
     notifier: _NotifierLike,
     model_name: Optional[str] = None,
     model_version: str = "latest",
+    high_risk_news_fn: Optional[Callable[[], bool]] = None,
 ) -> PaperTradingLoop:
     """Construct a :class:`PaperTradingLoop` with the project's defaults.
 
@@ -519,6 +532,7 @@ def build_paper_loop(
         strategy=strategy,
         notifier=notifier,
         predictor=predictor,
+        high_risk_news_fn=high_risk_news_fn,
     )
     loop.trading_enabled = trading_enabled
     return loop

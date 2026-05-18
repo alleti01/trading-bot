@@ -76,6 +76,10 @@ class Settings(BaseSettings):
     # ---- LLM agents ----------------------------------------------------
     ENABLE_LLM_AGENTS: bool = False
     OPENAI_API_KEY: Optional[SecretStr] = None
+    LLM_MODEL: str = "gpt-4o-mini"
+    LLM_TIMEOUT_SECONDS: int = Field(default=30, ge=1, le=300)
+    AGENTS_RUN_AT_EOD: bool = True
+    NEWS_CHECK_LOCAL_TIME: str = "09:25"
 
     # ---- Notifications -------------------------------------------------
     DISCORD_WEBHOOK_URL: Optional[SecretStr] = None
@@ -108,6 +112,7 @@ class Settings(BaseSettings):
         "TRADING_WINDOW_END",
         "FORCE_FLAT_TIME",
         "HEARTBEAT_LOCAL_TIME",
+        "NEWS_CHECK_LOCAL_TIME",
     )
     @classmethod
     def _validate_time(cls, v: str) -> str:
