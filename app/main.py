@@ -43,6 +43,29 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Run a Day-3 train smoke pass: synthetic OHLCV -> setups -> labels -> train -> register -> predict.",
     )
+    parser.add_argument(
+        "--smoke-backtest",
+        action="store_true",
+        help="Run a Day-4 backtest smoke pass against synthetic OHLCV.",
+    )
+    parser.add_argument(
+        "--backtest-csv",
+        type=str,
+        default=None,
+        help="Path to an OHLCV CSV. When provided with --mode BACKTEST runs the backtest engine.",
+    )
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default=None,
+        help="Optional model name in the registry to gate setups during backtest.",
+    )
+    parser.add_argument(
+        "--model-version",
+        type=str,
+        default="latest",
+        help="Model version (default 'latest').",
+    )
     return parser.parse_args(argv)
 
 
@@ -220,6 +243,125 @@ def _run_smoke_train(settings: Settings, log) -> int:
     return 0
 
 
+def _run_backtest(
+    settings: Settings,
+    log,
+    *,
+    ohlcv_df,
+    model_name: Optional[str],
+    model_version: str,
+    timeframe: str,
+) -> int:
+    """Shared backtest core used by both --smoke-backtest and --backtest-csv."""
+    from backtesting.engine import BacktestEngine
+    from features.feature_builder import build_features
+    from models.model_registry import load_model
+    from models.predictor import Predictor
+    from reports.backtest_report import write_backtest_report
+    from strategies.vwap_ema_pullback import VWAPEMAPullback
+
+    features = build_features(
+        ohlcv_df, instrument=settings.INSTRUMENT, tz=settings.TIMEZONE
+    )
+    log.info("backtest.features_built", rows_in=len(ohlcv_df), rows_out=len(features))
+
+    setups = VWAPEMAPullback(instrument=settings.INSTRUMENT).detect_setups(features)
+    log.info(
+        "backtest.setups",
+        n=len(setups),
+        long=sum(s.direction == "long" for s in setups),
+        short=sum(s.direction == "short" for s in setups),
+    )
+
+    predictor: Optional[Predictor] = None
+    if model_name:
+        try:
+            loaded = load_model(model_name, version=model_version)
+            predictor = Predictor(loaded)
+            log.info(
+                "backtest.predictor_loaded",
+                model_name=model_name,
+                model_version=loaded.metadata.get("version"),
+            )
+        except Exception as e:
+            log.error("backtest.predictor_load_failed", error=str(e))
+            return 5
+
+    engine = BacktestEngine(
+        settings=settings,
+        predictor=predictor,
+        starting_equity=0.0,
+        timeframe=timeframe,
+    )
+    result = engine.run(ohlcv_df, setups)
+
+    json_path, md_path = write_backtest_report(result, settings)
+    log.info("backtest.report_paths", json=str(json_path), md=str(md_path))
+
+    m = result.metrics
+    if m is not None:
+        log.info(
+            "backtest.metrics",
+            n_trades=m.n_trades,
+            net_pnl=round(m.net_pnl, 2),
+            win_rate=round(m.win_rate, 4),
+            profit_factor=round(m.profit_factor, 4),
+            expectancy=round(m.expectancy_per_trade, 2),
+            max_dd=round(m.max_drawdown_dollars, 2),
+            n_risk_blocked=result.n_setups_risk_blocked,
+            n_model_rejected=result.n_setups_model_rejected,
+        )
+    log.info("smoke.complete", message="Day 4 backtest run passed.")
+    return 0
+
+
+def _run_smoke_backtest(settings: Settings, log) -> int:
+    """Day-4 backtest smoke: synthetic OHLCV through the full pipeline."""
+    from tests.fixtures.synthetic import synthetic_ohlcv
+
+    df = synthetic_ohlcv(n_bars=2_000, tz=settings.TIMEZONE)
+    log.info(
+        "smoke.ohlcv",
+        rows=len(df),
+        first_ts=str(df.index.min()),
+        last_ts=str(df.index.max()),
+    )
+    return _run_backtest(
+        settings,
+        log,
+        ohlcv_df=df,
+        model_name=None,
+        model_version="latest",
+        timeframe="1m",
+    )
+
+
+def _run_backtest_from_csv(
+    settings: Settings,
+    log,
+    *,
+    csv_path: str,
+    model_name: Optional[str],
+    model_version: str,
+) -> int:
+    from data.csv_loader import load_ohlcv_csv
+
+    df = load_ohlcv_csv(
+        path=csv_path,
+        instrument=settings.INSTRUMENT,
+        timeframe="1m",
+        tz=settings.TIMEZONE,
+    )
+    return _run_backtest(
+        settings,
+        log,
+        ohlcv_df=df,
+        model_name=model_name,
+        model_version=model_version,
+        timeframe="1m",
+    )
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
 
@@ -262,12 +404,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.smoke_train:
         return _run_smoke_train(settings, log)
 
+    if args.smoke_backtest:
+        return _run_smoke_backtest(settings, log)
+
     # Real mode runners arrive on Days 3–5. For now just say so and exit.
     if settings.MODE == "TRAIN":
         log.warning("mode.not_implemented", mode="TRAIN", note="Day 3 deliverable")
         return 0
     if settings.MODE == "BACKTEST":
-        log.warning("mode.not_implemented", mode="BACKTEST", note="Day 4 deliverable")
+        if args.backtest_csv:
+            return _run_backtest_from_csv(
+                settings,
+                log,
+                csv_path=args.backtest_csv,
+                model_name=args.model_name,
+                model_version=args.model_version,
+            )
+        log.warning(
+            "backtest.no_input",
+            note="Provide --backtest-csv PATH or use --smoke-backtest.",
+        )
         return 0
     if settings.MODE == "PAPER":
         log.warning("mode.not_implemented", mode="PAPER", note="Day 5 deliverable")

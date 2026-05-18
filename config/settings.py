@@ -57,6 +57,11 @@ class Settings(BaseSettings):
     MAX_DAILY_PROFIT: float = Field(default=1500.0, ge=0.0)
     MAX_POSITION_SIZE: int = Field(default=1, ge=1)
     RISK_PER_TRADE: float = Field(default=100.0, ge=0.0)
+    MAX_OPEN_POSITIONS: int = Field(default=1, ge=1)
+    COOLDOWN_AFTER_LOSS_MINUTES: int = Field(default=5, ge=0)
+    COOLDOWN_AFTER_LARGE_WIN_MINUTES: int = Field(default=15, ge=0)
+    LARGE_WIN_THRESHOLD: float = Field(default=200.0, ge=0.0)
+    MAX_HOLD_BARS: int = Field(default=20, ge=1)
 
     # ---- Model ---------------------------------------------------------
     CONFIDENCE_THRESHOLD: float = 0.60
