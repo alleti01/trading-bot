@@ -124,6 +124,40 @@ class Settings(BaseSettings):
     AGENTS_RUN_AT_EOD: bool = True
     NEWS_CHECK_LOCAL_TIME: str = "09:25"
 
+    # ---- Multi-provider LLM keys --------------------------------------
+    # Each provider is optional; a missing key disables every agent
+    # routed to that provider (the rest still run). The bot never
+    # auto-routes a webhook signal or a trade through these — they are
+    # advisory-only inputs to the existing agent layer.
+    PERPLEXITY_API_KEY: Optional[SecretStr] = None
+    ANTHROPIC_API_KEY: Optional[SecretStr] = None
+    GEMINI_API_KEY: Optional[SecretStr] = None
+
+    # ---- Per-provider model overrides --------------------------------
+    # Each provider has a sensible default; operators can override
+    # without recompiling. ``LLM_MODEL`` is kept for back-compat and
+    # acts as the default for the OpenAI provider when
+    # ``OPENAI_MODEL`` is not set.
+    OPENAI_MODEL: Optional[str] = None
+    PERPLEXITY_MODEL: str = "sonar"
+    ANTHROPIC_MODEL: str = "claude-3-5-sonnet-latest"
+    GEMINI_MODEL: str = "gemini-1.5-flash"
+
+    # ---- Per-agent provider routing ----------------------------------
+    # The router reads these to decide which provider executes each
+    # advisory agent. Web-grounded research (news, macro, strategy)
+    # defaults to Perplexity; reasoning/summarization defaults to
+    # OpenAI. Set to "none" / "disabled" to switch an agent off
+    # without removing it from the orchestrator.
+    NEWS_AGENT_PROVIDER: str = "perplexity"
+    MACRO_NEWS_AGENT_PROVIDER: str = "perplexity"
+    STRATEGY_RESEARCH_AGENT_PROVIDER: str = "perplexity"
+    TRADE_ANALYSIS_AGENT_PROVIDER: str = "openai"
+    MODEL_REVIEW_AGENT_PROVIDER: str = "openai"
+    REPORT_AGENT_PROVIDER: str = "openai"
+    RISK_EXPLAINER_AGENT_PROVIDER: str = "openai"
+    TRADE_JOURNAL_AGENT_PROVIDER: str = "openai"
+
     # ---- Notifications -------------------------------------------------
     DISCORD_WEBHOOK_URL: Optional[SecretStr] = None
 

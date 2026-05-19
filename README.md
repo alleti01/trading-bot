@@ -663,10 +663,106 @@ agent layer back into trading is the existing
 - Pre-session `NewsAgent` failures **keep** the previous high-risk flag
   rather than silently re-enabling trading.
 
-**Running for real:** set `ENABLE_LLM_AGENTS=true` and provide
-`OPENAI_API_KEY` in `.env`. Without those the orchestrator is a no-op
-and the bot behaves exactly as in Days 1–6. The smoke command always
-uses `MockLLMClient`, so it never makes a real network call.
+**Running for real:** set `ENABLE_LLM_AGENTS=true` and provide at
+least one provider key (`OPENAI_API_KEY`, `PERPLEXITY_API_KEY`,
+`ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`) in `.env`. Without an
+enabled key, the orchestrator is a no-op and the bot behaves exactly
+as in Days 1–6. The smoke command always uses `MockLLMClient`, so it
+never makes a real network call.
+
+### Multi-provider routing
+
+Each advisory agent can target a different LLM provider so the
+research agents (`NewsAgent`, future `MacroNewsAgent` /
+`StrategyResearchAgent`) get web-grounded retrieval via Perplexity
+while reasoning agents (`TradeAnalysisAgent`, `ModelReviewAgent`,
+`ReportAgent`, etc.) use OpenAI / Anthropic / Gemini for cleaner
+structured summaries. The router lives at
+`agents/providers/router.py`; agents themselves are unchanged.
+
+| Agent (`name`)         | Default provider | Override env var                  | Why this default                  |
+| ---------------------- | ---------------- | --------------------------------- | --------------------------------- |
+| `news`                 | Perplexity       | `NEWS_AGENT_PROVIDER`             | Needs current web grounding.      |
+| `macro_news`           | Perplexity       | `MACRO_NEWS_AGENT_PROVIDER`       | Same — macro headlines move fast. |
+| `strategy_research`    | Perplexity       | `STRATEGY_RESEARCH_AGENT_PROVIDER`| Surveying public research.        |
+| `trade_analysis`       | OpenAI           | `TRADE_ANALYSIS_AGENT_PROVIDER`   | Structured per-trade narrative.   |
+| `model_review`         | OpenAI           | `MODEL_REVIEW_AGENT_PROVIDER`     | Calibration / drift reasoning.    |
+| `report`               | OpenAI           | `REPORT_AGENT_PROVIDER`           | Daily-report headline + bullets.  |
+| `risk_explainer`       | OpenAI           | `RISK_EXPLAINER_AGENT_PROVIDER`   | Operator-facing rule narrative.   |
+| `trade_journal`        | OpenAI           | `TRADE_JOURNAL_AGENT_PROVIDER`    | Per-day session highlights.       |
+
+Each override accepts `openai`, `perplexity`, `anthropic`, `gemini`,
+or `none` / `disabled` (turns the agent off without removing it from
+the orchestrator).
+
+**Routing rules:**
+
+- An agent is enabled only when **(a)** its provider name is
+  recognized and **(b)** that provider's API key is configured. A
+  missing key disables that agent — every other agent keeps running.
+- The router reuses one provider instance per provider name so all
+  agents routed to OpenAI share one `httpx` connection pool.
+- Provider failures (network, auth, bad shape) become
+  `LLMClientError` -> the existing `BaseAgent.run()` handler catches
+  them and persists `AgentResult(schema_valid=False, error=...)`. No
+  agent failure can ever crash the scheduler or paper loop.
+
+`.env` example for a mixed deployment:
+
+```ini
+ENABLE_LLM_AGENTS=true
+
+# Provider keys — set whichever providers you want to use.
+OPENAI_API_KEY=sk-...
+PERPLEXITY_API_KEY=pplx-...
+# ANTHROPIC_API_KEY=sk-ant-...
+# GEMINI_API_KEY=...
+
+# Optional model overrides (defaults shown)
+OPENAI_MODEL=gpt-4o-mini
+PERPLEXITY_MODEL=sonar
+ANTHROPIC_MODEL=claude-3-5-sonnet-latest
+GEMINI_MODEL=gemini-1.5-flash
+
+# Per-agent provider routing (defaults shown)
+NEWS_AGENT_PROVIDER=perplexity
+MACRO_NEWS_AGENT_PROVIDER=perplexity
+STRATEGY_RESEARCH_AGENT_PROVIDER=perplexity
+TRADE_ANALYSIS_AGENT_PROVIDER=openai
+MODEL_REVIEW_AGENT_PROVIDER=openai
+REPORT_AGENT_PROVIDER=openai
+RISK_EXPLAINER_AGENT_PROVIDER=openai
+TRADE_JOURNAL_AGENT_PROVIDER=openai
+```
+
+**Citations.** When a Perplexity-routed agent runs, the underlying
+`PerplexityProvider` returns a list of `Citation(url, title, snippet)`
+objects alongside the text. The MVP surfaces them via
+`ProviderLLMClient.last_citations`; a future iteration will pin them
+to the persisted `agent_outputs` row so daily reports can render
+"sources the news agent read".
+
+**API keys are secrets.** Never commit any of `OPENAI_API_KEY`,
+`PERPLEXITY_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY` to
+the repo. They belong in `.env` (which is `.gitignore`d) or in your
+runtime secret store. The bot's structured logger never emits the
+keys, but provider errors include upstream HTTP bodies — review them
+before pasting into a chat / issue.
+
+**Safety properties (still enforced):**
+
+- LLM agents cannot place trades or change any risk setting,
+  threshold, or strategy parameter. The new providers do not change
+  this — the architectural isolation test
+  (`tests/test_agent_isolation.py`) scans every file under `agents/`,
+  including `agents/providers/`, for any import of `execution/` or
+  `risk/` and refuses the build if one is added.
+- Models are **not** auto-promoted by any agent. Promotion still
+  requires the deterministic walk-forward workflow + an explicit
+  `--promote-model` invocation.
+- Webhook signals (`/webhooks/tradingview`) and the multi-symbol
+  paper loop both run the existing risk engine before any paper
+  trade. Agents are advisory inputs — they cannot route a fill.
 
 ## Trade analysis & mistake learning (Day 8)
 
@@ -930,8 +1026,19 @@ vars). See `.env.example` for the full list with comments. Key knobs:
 - `HEARTBEAT_LOCAL_TIME` — daily Discord heartbeat (default `08:00`).
 - `REPORTS_DIR` — where Markdown + JSON + CSV reports land.
 - `ENABLE_LLM_AGENTS` — Day 7 master switch (default `false`).
-- `OPENAI_API_KEY` — required when agents are enabled.
-- `LLM_MODEL` — OpenAI chat model (default `gpt-4o-mini`).
+- `OPENAI_API_KEY` / `PERPLEXITY_API_KEY` / `ANTHROPIC_API_KEY` /
+  `GEMINI_API_KEY` — provider keys. Each is independent; agents
+  routed to a provider with no key are gracefully disabled.
+- `LLM_MODEL` — legacy default for OpenAI when `OPENAI_MODEL` is unset
+  (default `gpt-4o-mini`).
+- `OPENAI_MODEL` / `PERPLEXITY_MODEL` / `ANTHROPIC_MODEL` /
+  `GEMINI_MODEL` — per-provider model overrides.
+- `NEWS_AGENT_PROVIDER` / `MACRO_NEWS_AGENT_PROVIDER` /
+  `STRATEGY_RESEARCH_AGENT_PROVIDER` /
+  `TRADE_ANALYSIS_AGENT_PROVIDER` /
+  `MODEL_REVIEW_AGENT_PROVIDER` / `REPORT_AGENT_PROVIDER` /
+  `RISK_EXPLAINER_AGENT_PROVIDER` / `TRADE_JOURNAL_AGENT_PROVIDER` —
+  per-agent provider routing. Set to `none` to disable an agent.
 - `LLM_TIMEOUT_SECONDS` — per-call timeout (default 30).
 - `AGENTS_RUN_AT_EOD` — whether the EOD scheduler job triggers the agents.
 - `NEWS_CHECK_LOCAL_TIME` — pre-session NewsAgent cron time (default `09:25`).
@@ -1022,6 +1129,7 @@ risk/                   deterministic engine, kill switch, position sizing
 compliance/             generic + Tradeify-inspired rules
 execution/              base, paper executor, LIVE placeholders (refuse)
 agents/                 LLM advisory agents (schemas, no execution access)
+agents/providers/       Multi-provider LLM router (OpenAI/Perplexity/Anthropic/Gemini)
 analysis/               post-trade analyzer, mistake classifier, pattern miner,
                         improvement suggester, feedback dataset, promotion
 notifications/          Discord webhook + rate-limited dispatcher

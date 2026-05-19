@@ -35,6 +35,7 @@ from agents.base_agent import AgentContext, BaseAgent
 from agents.llm_client import LLMClient
 from agents.model_review_agent import ModelReviewAgent
 from agents.news_agent import NewsAgent
+from agents.providers.router import ProviderRouter
 from agents.report_agent import ReportAgent
 from agents.risk_explainer_agent import RiskExplainerAgent
 from agents.schemas import AgentResult, NewsAssessment
@@ -84,14 +85,28 @@ class AgentOrchestrator:
         self,
         settings: Settings,
         *,
-        llm: Optional[LLMClient],
+        llm: Optional[LLMClient] = None,
         notifier: NotificationService,
+        provider_router: Optional[ProviderRouter] = None,
     ) -> None:
+        # Two ways to wire LLM access (mutually exclusive in spirit but
+        # we prefer the router when both are passed):
+        # - ``provider_router``: per-agent dispatch (the new path).
+        # - ``llm``: single legacy client shared by every agent. Tests
+        #   that pass :class:`MockLLMClient` rely on this and must keep
+        #   working unchanged.
+        # When neither is given the orchestrator runs as a no-op.
         self.settings = settings
         self.llm = llm
+        self.provider_router = provider_router
         self.notifier = notifier
         self.log = get_logger("agents.orchestrator")
         self._high_risk_news_active: bool = False
+        if provider_router is not None:
+            self.log.info(
+                "agents.router_active",
+                routing=provider_router.routing_table(),
+            )
 
     # ------------------------------------------------------------------
     # Public read-only state
@@ -99,6 +114,32 @@ class AgentOrchestrator:
     def high_risk_news_active(self) -> bool:
         """Latest NewsAgent verdict; default False on init or LLM disabled."""
         return self._high_risk_news_active
+
+    # ------------------------------------------------------------------
+    # Internal: per-agent client selection
+    # ------------------------------------------------------------------
+    def _client_for(self, agent_name: str) -> Optional[LLMClient]:
+        """Pick the LLM client for a given agent.
+
+        Resolution order:
+
+        1. If a :class:`ProviderRouter` is wired, ask it. Returns
+           ``None`` if the agent is disabled or its API key is missing
+           — the orchestrator skips such agents and persists a clear
+           ``AgentResult(schema_valid=False, error="agent.disabled")``
+           row for the audit trail.
+        2. Otherwise fall back to the single-client legacy path
+           (``self.llm``), which preserves test-suite behavior with
+           ``MockLLMClient``.
+        """
+        if self.provider_router is not None:
+            return self.provider_router.client_for(agent_name)
+        return self.llm
+
+    def _has_any_llm(self) -> bool:
+        if self.provider_router is not None:
+            return self.provider_router.has_any_enabled()
+        return self.llm is not None
 
     # ------------------------------------------------------------------
     # Pre-session news
@@ -113,7 +154,8 @@ class AgentOrchestrator:
         leave the previous flag unchanged so a transient LLM hiccup
         does not silently *unblock* trading mid-day.
         """
-        if self.llm is None:
+        client = self._client_for("news")
+        if client is None:
             self.log.info("agents.disabled", phase="pre_session_news")
             return None
         now = now or datetime.now(tz=timezone.utc)
@@ -123,7 +165,7 @@ class AgentOrchestrator:
             session_date=sd,
             instrument=self.settings.INSTRUMENT,
         )
-        agent = NewsAgent(self.llm)
+        agent = NewsAgent(client)
         result = agent.run(ctx)
         self._persist_result(result)
         if result.schema_valid and result.payload is not None:
@@ -167,7 +209,7 @@ class AgentOrchestrator:
         now = now or datetime.now(tz=timezone.utc)
         sd = session_date(now, self.settings).isoformat()
         result = OrchestratorResult(session_date=sd)
-        if self.llm is None:
+        if not self._has_any_llm():
             self.log.info("agents.disabled", phase="end_of_day")
             return result
 
@@ -184,14 +226,35 @@ class AgentOrchestrator:
             model_metadata=self._load_latest_model_metadata(now=now),
         )
 
-        agents: list[BaseAgent] = [
-            NewsAgent(self.llm),
-            RiskExplainerAgent(self.llm),
-            TradeJournalAgent(self.llm),
-            ReportAgent(self.llm),
-            ModelReviewAgent(self.llm),
+        # Each agent is constructed with its *own* LLM client (resolved
+        # via the router). Agents whose provider is disabled or whose
+        # API key is missing are skipped with a clear ``AgentResult``
+        # row so the audit trail still records the absence.
+        agent_specs: list[tuple[str, type[BaseAgent]]] = [
+            ("news", NewsAgent),
+            ("risk_explainer", RiskExplainerAgent),
+            ("trade_journal", TradeJournalAgent),
+            ("report", ReportAgent),
+            ("model_review", ModelReviewAgent),
         ]
-        for agent in agents:
+        for agent_name, agent_cls in agent_specs:
+            client = self._client_for(agent_name)
+            if client is None:
+                ar = AgentResult(
+                    agent_name=agent_name,
+                    schema_valid=False,
+                    payload=None,
+                    raw_text=None,
+                    error="agent.disabled: no LLM client (missing key or off)",
+                )
+                self.log.info(
+                    "agents.skipped_no_provider",
+                    agent=agent_name,
+                )
+                result.results[agent_name] = ar
+                self._persist_result(ar)
+                continue
+            agent = agent_cls(client)
             try:
                 ar = agent.run(context)
             except Exception as e:  # pragma: no cover - run() is supposed to catch
@@ -362,15 +425,53 @@ def build_orchestrator(
     *,
     notifier: NotificationService,
     llm: Optional[LLMClient] = None,
+    provider_router: Optional[ProviderRouter] = None,
 ) -> AgentOrchestrator:
     """Build an :class:`AgentOrchestrator`.
 
-    If ``llm`` is omitted, :func:`agents.llm_client.build_llm_client` is
-    consulted. The orchestrator returns no-ops when ``llm`` is None, so
-    callers can always construct one safely.
-    """
-    if llm is None:
-        from agents.llm_client import build_llm_client
+    Three resolution paths:
 
-        llm = build_llm_client(settings)
-    return AgentOrchestrator(settings, llm=llm, notifier=notifier)
+    1. ``llm`` is passed in explicitly: legacy single-client mode.
+       Used by tests that wire :class:`agents.llm_client.MockLLMClient`.
+    2. ``provider_router`` is passed in: per-agent dispatch.
+    3. Neither is passed and ``ENABLE_LLM_AGENTS=true``: build a
+       :class:`ProviderRouter` from settings. If at least one
+       configured agent has a working provider key, we use it. If
+       nothing is wired (no keys at all) we fall back to the legacy
+       :func:`agents.llm_client.build_llm_client` path so single-key
+       OpenAI deployments keep working unchanged.
+
+    The orchestrator returns no-ops when neither ``llm`` nor a
+    populated router is available, so callers can always construct
+    one safely.
+    """
+    if llm is not None:
+        return AgentOrchestrator(settings, llm=llm, notifier=notifier)
+
+    if provider_router is not None:
+        return AgentOrchestrator(
+            settings, provider_router=provider_router, notifier=notifier
+        )
+
+    log = get_logger("agents.orchestrator")
+
+    if not settings.ENABLE_LLM_AGENTS:
+        log.info("agents.disabled", reason="ENABLE_LLM_AGENTS=false")
+        return AgentOrchestrator(settings, llm=None, notifier=notifier)
+
+    router = ProviderRouter.from_settings(settings)
+    if router.has_any_enabled():
+        return AgentOrchestrator(
+            settings, provider_router=router, notifier=notifier
+        )
+
+    # Backward compatibility: no per-provider keys configured but the
+    # legacy ``OPENAI_API_KEY`` path may still be wired.
+    from agents.llm_client import build_llm_client
+
+    legacy = build_llm_client(settings)
+    if legacy is None:
+        log.info(
+            "agents.disabled", reason="no_provider_keys_configured"
+        )
+    return AgentOrchestrator(settings, llm=legacy, notifier=notifier)
