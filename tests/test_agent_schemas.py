@@ -150,7 +150,9 @@ def test_model_review_retrain_required_bool() -> None:
 
 
 def test_agent_schemas_map_covers_known_agents() -> None:
-    """The five Day-7 agents plus the Day-8 trade_analysis agent."""
+    """Day 7 (5 agents) + Day 8 trade_analysis + the autonomous-paper
+    additions (macro_news / backtest_critic / model_drift /
+    strategy_research / data_quality)."""
     assert set(AGENT_SCHEMAS.keys()) == {
         "news",
         "risk_explainer",
@@ -158,6 +160,11 @@ def test_agent_schemas_map_covers_known_agents() -> None:
         "report",
         "model_review",
         "trade_analysis",
+        "macro_news",
+        "backtest_critic",
+        "model_drift",
+        "strategy_research",
+        "data_quality",
     }
 
 

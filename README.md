@@ -670,70 +670,269 @@ enabled key, the orchestrator is a no-op and the bot behaves exactly
 as in Days 1–6. The smoke command always uses `MockLLMClient`, so it
 never makes a real network call.
 
-### Multi-provider routing
+### Agent provider routing
 
-Each advisory agent can target a different LLM provider so the
-research agents (`NewsAgent`, future `MacroNewsAgent` /
-`StrategyResearchAgent`) get web-grounded retrieval via Perplexity
-while reasoning agents (`TradeAnalysisAgent`, `ModelReviewAgent`,
-`ReportAgent`, etc.) use OpenAI / Anthropic / Gemini for cleaner
-structured summaries. The router lives at
-`agents/providers/router.py`; agents themselves are unchanged.
+Each advisory agent picks the right tool for its job:
 
-| Agent (`name`)         | Default provider | Override env var                  | Why this default                  |
-| ---------------------- | ---------------- | --------------------------------- | --------------------------------- |
-| `news`                 | Perplexity       | `NEWS_AGENT_PROVIDER`             | Needs current web grounding.      |
-| `macro_news`           | Perplexity       | `MACRO_NEWS_AGENT_PROVIDER`       | Same — macro headlines move fast. |
-| `strategy_research`    | Perplexity       | `STRATEGY_RESEARCH_AGENT_PROVIDER`| Surveying public research.        |
-| `trade_analysis`       | OpenAI           | `TRADE_ANALYSIS_AGENT_PROVIDER`   | Structured per-trade narrative.   |
-| `model_review`         | OpenAI           | `MODEL_REVIEW_AGENT_PROVIDER`     | Calibration / drift reasoning.    |
-| `report`               | OpenAI           | `REPORT_AGENT_PROVIDER`           | Daily-report headline + bullets.  |
-| `risk_explainer`       | OpenAI           | `RISK_EXPLAINER_AGENT_PROVIDER`   | Operator-facing rule narrative.   |
-| `trade_journal`        | OpenAI           | `TRADE_JOURNAL_AGENT_PROVIDER`    | Per-day session highlights.       |
+- **Perplexity** for live, web-grounded research — `NewsAgent`,
+  `MacroNewsAgent`, `StrategyResearchAgent`.
+- **OpenAI** for structured analysis / reporting — `TradeAnalysisAgent`,
+  `ModelReviewAgent`, `ReportAgent`, `RiskExplainerAgent`,
+  `TradeJournalAgent`, `BacktestCriticAgent`.
+- **Deterministic code** by default — `ModelDriftAgent`,
+  `DataQualityAgent`. They never call an LLM unless the operator
+  explicitly opts in (set the agent's `*_AGENT_PROVIDER` to a real
+  provider AND its `*_AGENT_MODEL` to a real model).
 
-Each override accepts `openai`, `perplexity`, `anthropic`, `gemini`,
-or `none` / `disabled` (turns the agent off without removing it from
-the orchestrator).
+The router lives at `agents/providers/router.py`; agents themselves
+are unchanged. `Anthropic` and `Gemini` are recognized as valid
+provider names; their providers ship in this repo and activate as
+soon as `ANTHROPIC_API_KEY` or `GEMINI_API_KEY` is set.
+
+| Agent (`name`)          | Default provider     | Default model env                | Override env var                    |
+| ----------------------- | -------------------- | -------------------------------- | ----------------------------------- |
+| `news`                  | Perplexity           | `PERPLEXITY_DEFAULT_MODEL`       | `NEWS_AGENT_PROVIDER` / `NEWS_AGENT_MODEL` |
+| `macro_news`            | Perplexity           | `PERPLEXITY_DEFAULT_MODEL`       | `MACRO_NEWS_AGENT_PROVIDER` / `MACRO_NEWS_AGENT_MODEL` |
+| `strategy_research`     | Perplexity           | `STRATEGY_RESEARCH_AGENT_MODEL` (`sonar-deep-research`) | `STRATEGY_RESEARCH_AGENT_PROVIDER` / `STRATEGY_RESEARCH_AGENT_MODEL` |
+| `trade_analysis`        | OpenAI               | `OPENAI_DEFAULT_MODEL`           | `TRADE_ANALYSIS_AGENT_PROVIDER` / `TRADE_ANALYSIS_AGENT_MODEL` |
+| `report`                | OpenAI               | `OPENAI_DEFAULT_MODEL`           | `REPORT_AGENT_PROVIDER` / `REPORT_AGENT_MODEL` |
+| `risk_explainer`        | OpenAI               | `OPENAI_DEFAULT_MODEL`           | `RISK_EXPLAINER_AGENT_PROVIDER` / `RISK_EXPLAINER_AGENT_MODEL` |
+| `trade_journal`         | OpenAI               | `OPENAI_DEFAULT_MODEL`           | `TRADE_JOURNAL_AGENT_PROVIDER` / `TRADE_JOURNAL_AGENT_MODEL` |
+| `model_review`          | OpenAI               | `OPENAI_REVIEW_MODEL`            | `MODEL_REVIEW_AGENT_PROVIDER` / `MODEL_REVIEW_AGENT_MODEL` |
+| `backtest_critic`       | OpenAI               | `OPENAI_REVIEW_MODEL`            | `BACKTEST_CRITIC_AGENT_PROVIDER` / `BACKTEST_CRITIC_AGENT_MODEL` |
+| `model_drift`           | none (stats)         | n/a                              | `MODEL_DRIFT_AGENT_PROVIDER` / `MODEL_DRIFT_AGENT_MODEL` |
+| `data_quality`          | none (deterministic) | n/a                              | `DATA_QUALITY_AGENT_PROVIDER` / `DATA_QUALITY_AGENT_MODEL` |
+
+Each `*_AGENT_PROVIDER` accepts `openai`, `perplexity`, `anthropic`,
+`gemini`, or `none` / `off` / `disabled` (turns the agent off without
+removing it from the orchestrator). The Settings layer rejects any
+other value at config-load time so a typo cannot silently disable a
+critical agent.
 
 **Routing rules:**
 
 - An agent is enabled only when **(a)** its provider name is
   recognized and **(b)** that provider's API key is configured. A
   missing key disables that agent — every other agent keeps running.
-- The router reuses one provider instance per provider name so all
-  agents routed to OpenAI share one `httpx` connection pool.
+- Per-agent model overrides flow through to the underlying provider
+  instance, so `BacktestCriticAgent` runs on `OPENAI_REVIEW_MODEL`
+  while `TradeJournalAgent` runs on `OPENAI_DEFAULT_MODEL` even
+  though both are routed to OpenAI.
+- The router never logs API keys. Construction / disable logs only
+  carry `provider`, `model`, `agent`, and a `reason` string.
 - Provider failures (network, auth, bad shape) become
   `LLMClientError` -> the existing `BaseAgent.run()` handler catches
-  them and persists `AgentResult(schema_valid=False, error=...)`. No
-  agent failure can ever crash the scheduler or paper loop.
+  them and persists `AgentResult(schema_valid=False, error=...)`.
+  No agent failure can ever crash the scheduler or the paper loop.
 
-`.env` example for a mixed deployment:
+#### Where keys go
+
+- **`/Users/<you>/.../.env`** (your local file, `.gitignore`d) holds
+  real keys.
+- **`.env.example`** is committed and contains placeholders only.
+- **`config/settings.py`** holds the field definitions + default
+  models. It does not store keys.
+- **`agents/providers/router.py`** reads keys via `Settings`,
+  constructs providers lazily, and never echoes keys anywhere.
+
+**NEVER commit `.env`.** If a real key ever lands in the repo, rotate
+it immediately at the provider, then `git filter-repo` (or `bfg`) it
+out of history.
+
+#### `.env` block — copy from `.env.example` and fill in your keys
 
 ```ini
-ENABLE_LLM_AGENTS=true
+# =========================
+# LLM / RESEARCH API KEYS
+# =========================
 
-# Provider keys — set whichever providers you want to use.
-OPENAI_API_KEY=sk-...
-PERPLEXITY_API_KEY=pplx-...
-# ANTHROPIC_API_KEY=sk-ant-...
-# GEMINI_API_KEY=...
+# Used by OpenAI-powered agents:
+# TradeAnalysisAgent, ModelReviewAgent, ReportAgent,
+# RiskExplainerAgent, TradeJournalAgent, BacktestCriticAgent.
+OPENAI_API_KEY=
 
-# Optional model overrides (defaults shown)
-OPENAI_MODEL=gpt-4o-mini
-PERPLEXITY_MODEL=sonar
-ANTHROPIC_MODEL=claude-3-5-sonnet-latest
-GEMINI_MODEL=gemini-1.5-flash
+# Used by Perplexity-powered agents:
+# NewsAgent, MacroNewsAgent, StrategyResearchAgent.
+PERPLEXITY_API_KEY=
 
-# Per-agent provider routing (defaults shown)
+# Optional future providers. Not required right now.
+ANTHROPIC_API_KEY=
+GEMINI_API_KEY=
+
+
+# =========================
+# AGENT PROVIDER ROUTING
+# =========================
+
+# Web/current research agents.
 NEWS_AGENT_PROVIDER=perplexity
 MACRO_NEWS_AGENT_PROVIDER=perplexity
 STRATEGY_RESEARCH_AGENT_PROVIDER=perplexity
+
+# Structured reasoning / reporting agents.
 TRADE_ANALYSIS_AGENT_PROVIDER=openai
 MODEL_REVIEW_AGENT_PROVIDER=openai
 REPORT_AGENT_PROVIDER=openai
 RISK_EXPLAINER_AGENT_PROVIDER=openai
 TRADE_JOURNAL_AGENT_PROVIDER=openai
+BACKTEST_CRITIC_AGENT_PROVIDER=openai
+
+# Stats-only by default. Set to "openai" only if you want optional narrative polish.
+MODEL_DRIFT_AGENT_PROVIDER=none
+
+# Data quality should stay deterministic/code-based by default.
+DATA_QUALITY_AGENT_PROVIDER=none
+
+
+# =========================
+# PERPLEXITY MODELS
+# =========================
+
+# Default Perplexity model for current market/news research.
+PERPLEXITY_DEFAULT_MODEL=sonar-pro
+
+# Fast/current research.
+NEWS_AGENT_MODEL=sonar-pro
+MACRO_NEWS_AGENT_MODEL=sonar-pro
+
+# Heavier research. Use sparingly, such as weekly strategy research.
+STRATEGY_RESEARCH_AGENT_MODEL=sonar-deep-research
+
+
+# =========================
+# OPENAI MODELS
+# =========================
+
+# OpenAI default for normal structured outputs.
+# Keep this configurable because available model names may change.
+OPENAI_DEFAULT_MODEL=gpt-4o-mini
+
+# Stronger model for harder reviews/audits.
+OPENAI_REVIEW_MODEL=gpt-4o
+
+# Per-agent OpenAI model mapping. The ``${VAR}`` shorthand below is
+# *documentation only* — pydantic-settings does not expand env vars.
+# Leave a per-agent value empty / "none" / "${OPENAI_DEFAULT_MODEL}"
+# to inherit the right default; set a concrete model name to override.
+TRADE_ANALYSIS_AGENT_MODEL=${OPENAI_DEFAULT_MODEL}
+TRADE_JOURNAL_AGENT_MODEL=${OPENAI_DEFAULT_MODEL}
+REPORT_AGENT_MODEL=${OPENAI_DEFAULT_MODEL}
+RISK_EXPLAINER_AGENT_MODEL=${OPENAI_DEFAULT_MODEL}
+
+MODEL_REVIEW_AGENT_MODEL=${OPENAI_REVIEW_MODEL}
+BACKTEST_CRITIC_AGENT_MODEL=${OPENAI_REVIEW_MODEL}
+
+# Model drift should mostly be deterministic stats.
+# Set MODEL_DRIFT_AGENT_PROVIDER=openai and this to an OpenAI model
+# only if narrative summaries are needed.
+MODEL_DRIFT_AGENT_MODEL=none
+
+# DataQualityAgent should not use an LLM by default.
+DATA_QUALITY_AGENT_MODEL=none
 ```
+
+#### Safety guarantees (still enforced)
+
+- LLM agents are advisory only. **No** agent or provider can call
+  `execution/`, change risk caps, modify model thresholds, or
+  auto-promote a model. The architectural-isolation test
+  (`tests/test_agent_isolation.py`) fails the build if any module
+  under `agents/` imports `execution/` or `risk/`.
+- Failed provider calls (network, auth, schema) raise
+  `ProviderError` → `LLMClientError`, which `BaseAgent.run()`
+  catches and persists as a clean `AgentResult(schema_valid=False)`
+  row. PAPER mode and the scheduler keep running.
+- Missing API keys disable the affected agents only — never the
+  whole bot. Every disable / construct event is logged with the
+  agent name, provider, and reason, but **never** the key value.
+
+### Autonomous-paper / research agents
+
+The agents below are advisory-only inputs to specific workflows
+rather than members of the EOD batch. They share the same provider
+router and the same architectural-isolation guarantees.
+
+- `MacroNewsAgent` (web-grounded). Researches today's macro / event
+  calendar across `ENABLED_SYMBOLS` and emits a
+  `MacroNewsAssessment(risk_level, affected_symbols, blocked_windows,
+  key_events, sources, summary)`. The orchestrator method
+  `run_macro_news()` flips the existing `high_risk_news_active` flag
+  on `risk_level=="high"` or any populated `blocked_windows` —
+  block-only, exactly like `NewsAgent`. Affected symbols are filtered
+  against the operator's universe before reaching anything
+  operational.
+
+- `BacktestCriticAgent` (reasoning). Reviews a backtest summary plus
+  the recent paper-mode metrics and emits a `BacktestCritique` with
+  weak spots (time windows, symbols, confidence buckets, regimes).
+  **Every recommendation is experiment-shaped** (hypothesis +
+  experiment plan + risks). The schema has no field that could
+  encode "change parameter X to Y" — that's intentional. Invoke via
+  `orchestrator.run_backtest_critic(backtest_summary)` immediately
+  after a backtest finishes.
+
+- `ModelDriftAgent` (stats-first, optional LLM polish). Compares
+  paper metrics (win rate, expectancy, profit factor, drawdown,
+  false positive rate) against the model's training expectations and
+  emits a `ModelDriftReport` with per-metric deltas + a single
+  `severity` ∈ `none|watch|warn|alert`. `alert` flips
+  `retrain_recommended=True`. Promotion still requires the
+  deterministic walk-forward + `--promote-model` workflow — the
+  agent only *advises*. Invoked from daily / weekly review code via
+  `orchestrator.run_model_drift_review()`. The deterministic stats
+  path runs even with no LLM configured.
+
+- `StrategyResearchAgent` (web-grounded). Surfaces strategy / filter
+  ideas worth backtesting, written as `StrategyExperimentIdea`
+  records (title + hypothesis + experiment plan + risks +
+  related_filters). Cannot suggest code or threshold changes — the
+  schema enforces shape and the system prompt enforces tone.
+  Invoked off-cycle via `orchestrator.run_strategy_research()`.
+
+- `DataQualityAgent` (deterministic, no LLM). Pre-paper-loop
+  pre-flight check. Detects empty feeds, stale feeds, missing
+  candles, duplicate timestamps, geometrically impossible OHLCV,
+  and aggregate data gaps. Returns a `DataQualityReport`; the
+  operative field is `blocked_symbols`. Paper mode reads that list
+  and refuses to start the per-symbol loop on any blocked symbol.
+  Direct entry point: `DataQualityAgent().run_with_feeds(...)` or
+  `orchestrator.run_data_quality_check(feeds_by_symbol={...})`.
+
+**Workflow hooks**
+
+```python
+# Pre-paper data-quality gate
+report = orchestrator.run_data_quality_check(feeds_by_symbol={
+    "MES": mes_df, "MNQ": mnq_df, "MGC": mgc_df,
+})
+if report and report.blocked_symbols:
+    log.warning("paper.skipping_symbols", blocked=report.blocked_symbols)
+
+# Pre-session macro news (sets high_risk_news_active block-only)
+orchestrator.run_macro_news()
+
+# After backtest
+orchestrator.run_backtest_critic(backtest_summary=result.to_dict())
+
+# Daily / weekly review
+drift = orchestrator.run_model_drift_review()
+if drift and drift.retrain_recommended:
+    log.warning(
+        "model.drift_alert",
+        severity=drift.severity,
+        reason=drift.reason,
+    )
+
+# Off-cycle ideation
+ideas = orchestrator.run_strategy_research(
+    backtest_summary=result.to_dict(),
+)
+```
+
+All five agents follow the same safety rules as the EOD batch:
+they cannot import `execution/` or `risk/`, they cannot place
+trades or modify any risk setting, and `tests/test_agent_isolation.py`
+fails the build if any new agent breaks that contract.
 
 **Citations.** When a Perplexity-routed agent runs, the underlying
 `PerplexityProvider` returns a list of `Citation(url, title, snippet)`

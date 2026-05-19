@@ -71,6 +71,13 @@ class AgentContext:
     daily_report: dict[str, Any] = field(default_factory=dict)
     model_metadata: Optional[dict[str, Any]] = None
     news_headlines: list[str] = field(default_factory=list)
+    # Optional inputs the new advisory agents read. They are kept on
+    # ``AgentContext`` (not on a per-agent kwargs dict) so the existing
+    # ``BaseAgent.run(context)`` signature is unchanged.
+    backtest_summary: Optional[dict[str, Any]] = None
+    paper_metrics: Optional[dict[str, Any]] = None
+    data_quality: Optional[dict[str, Any]] = None
+    enabled_symbols: list[str] = field(default_factory=list)
 
     def session_date_obj(self) -> _date:
         return _date.fromisoformat(self.session_date)

@@ -58,10 +58,9 @@ DISABLED_NAMES: frozenset[str] = frozenset(
 )
 
 # Maps the canonical agent id (the value of ``BaseAgent.name``) to the
-# Settings attribute holding its provider choice. Future agents that
-# don't yet exist as classes (``macro_news``, ``strategy_research``)
-# are listed too so the router pre-validates their config; the
-# orchestrator just doesn't construct an instance for them yet.
+# Settings attribute holding its provider choice. Listing ``data_quality``
+# here makes its routing visible in dashboards / tests even though the
+# agent itself runs deterministically and never calls the router.
 AGENT_PROVIDER_FIELDS: dict[str, str] = {
     "news": "NEWS_AGENT_PROVIDER",
     "macro_news": "MACRO_NEWS_AGENT_PROVIDER",
@@ -71,6 +70,38 @@ AGENT_PROVIDER_FIELDS: dict[str, str] = {
     "report": "REPORT_AGENT_PROVIDER",
     "risk_explainer": "RISK_EXPLAINER_AGENT_PROVIDER",
     "trade_journal": "TRADE_JOURNAL_AGENT_PROVIDER",
+    "backtest_critic": "BACKTEST_CRITIC_AGENT_PROVIDER",
+    "model_drift": "MODEL_DRIFT_AGENT_PROVIDER",
+    "data_quality": "DATA_QUALITY_AGENT_PROVIDER",
+}
+
+# Same idea for the per-agent model overrides. The router looks up the
+# resolved model via ``Settings.model_for_agent(name)`` so the
+# ``${OPENAI_DEFAULT_MODEL}``-style shorthand operators may write in
+# ``.env`` collapses to a real model name automatically.
+AGENT_MODEL_FIELDS: dict[str, str] = {
+    "news": "NEWS_AGENT_MODEL",
+    "macro_news": "MACRO_NEWS_AGENT_MODEL",
+    "strategy_research": "STRATEGY_RESEARCH_AGENT_MODEL",
+    "trade_analysis": "TRADE_ANALYSIS_AGENT_MODEL",
+    "model_review": "MODEL_REVIEW_AGENT_MODEL",
+    "report": "REPORT_AGENT_MODEL",
+    "risk_explainer": "RISK_EXPLAINER_AGENT_MODEL",
+    "trade_journal": "TRADE_JOURNAL_AGENT_MODEL",
+    "backtest_critic": "BACKTEST_CRITIC_AGENT_MODEL",
+    "model_drift": "MODEL_DRIFT_AGENT_MODEL",
+    "data_quality": "DATA_QUALITY_AGENT_MODEL",
+}
+
+# Providers that need an API key to be usable. ``anthropic`` and
+# ``gemini`` are recognized as valid providers but disabled until the
+# corresponding API key is set; this matches the spec's "future
+# providers" expectation.
+PROVIDERS_NEEDING_KEY: dict[str, str] = {
+    "openai": "OPENAI_API_KEY",
+    "perplexity": "PERPLEXITY_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "gemini": "GEMINI_API_KEY",
 }
 
 
@@ -135,20 +166,39 @@ class ProviderLLMClient(LLMClient):
 class _ProviderSpec:
     """Internal record of how to construct a provider lazily.
 
+    ``available`` captures whether the API key is set; the factory is
+    only called when we actually need an instance. ``default_model``
+    is what we hand to a provider routed for an agent that did not
+    set a per-agent model override.
+
     Lazily because we don't want to fail boot when a single key is
     missing — only the agents routed to that provider should disable.
     """
 
     name: str
-    factory: Callable[[], Optional[BaseLLMProvider]]
+    available: bool
+    default_model: Optional[str]
+    build: Callable[[str], BaseLLMProvider]
 
 
 class ProviderRouter:
     """Selects the right :class:`BaseLLMProvider` for each agent.
 
-    Construct via :meth:`from_settings`. The router caches one
-    instance per provider name (so all agents routed to OpenAI share
-    a single ``OpenAIProvider`` and httpx connection pool).
+    Construct via :meth:`from_settings`. The router supports two
+    layers of caching:
+
+    1. **Provider-by-name** (``_provider_cache``): the legacy hook
+       used by tests that monkey-patch a provider for *every* agent
+       sharing that provider name (``router._provider_cache["openai"]
+       = mock``). When an entry is present here, all agents routed to
+       that provider name reuse it as-is — model overrides are
+       ignored. This keeps existing tests + simple "share one client
+       across agents" deployments working.
+    2. **Provider-by-agent** (``_agent_provider_cache``): when no
+       legacy injection exists, each agent gets its own provider
+       instance built with that agent's resolved model (so
+       ``model_review`` can run on ``OPENAI_REVIEW_MODEL`` while
+       ``trade_journal`` runs on ``OPENAI_DEFAULT_MODEL``).
 
     Public API:
 
@@ -161,19 +211,29 @@ class ProviderRouter:
     - :meth:`is_enabled(agent_name)` is a cheap precheck.
     - :meth:`enabled_agents()` reports the set of agent ids that have
       a working provider given the current settings.
+
+    The router never logs API keys. Disable / construct logs include
+    only ``provider``, ``model``, ``agent``, and a ``reason`` string.
     """
 
     def __init__(
         self,
         *,
         agent_provider_choice: dict[str, str],
+        agent_models: dict[str, Optional[str]],
         provider_specs: dict[str, _ProviderSpec],
         log_disabled: Optional[Callable[[str, dict[str, Any]], None]] = None,
     ) -> None:
         self._choices = dict(agent_provider_choice)
+        self._agent_models = dict(agent_models)
         self._provider_specs = dict(provider_specs)
-        # Memoized provider instances by canonical name.
+        # Memoized provider instances by canonical provider name —
+        # legacy back-compat hook for tests that inject a single
+        # provider for every agent in that family.
         self._provider_cache: dict[str, Optional[BaseLLMProvider]] = {}
+        # Memoized provider instances by *agent* name. Each entry
+        # captures the agent's specific model override.
+        self._agent_provider_cache: dict[str, Optional[BaseLLMProvider]] = {}
         # Memoized LLMClient adapters by agent name (different agents
         # routed to the same provider still share the underlying
         # provider instance — they just get separate adapters).
@@ -203,92 +263,85 @@ class ProviderRouter:
         gemini_key = _key("GEMINI_API_KEY")
 
         timeout = float(settings.LLM_TIMEOUT_SECONDS)
-        # OPENAI_MODEL falls back to LLM_MODEL so single-provider users
-        # don't need to set both.
-        openai_model = settings.OPENAI_MODEL or settings.LLM_MODEL
+        # ``OPENAI_DEFAULT_MODEL`` is the modern knob; ``OPENAI_MODEL``
+        # is the legacy fallback so single-provider deployments don't
+        # need to add a new env var.
+        openai_default_model = (
+            settings.OPENAI_MODEL or settings.OPENAI_DEFAULT_MODEL
+        )
+
+        def _openai_build(model: str) -> BaseLLMProvider:
+            return OpenAIProvider(
+                openai_key, model=model, timeout_seconds=timeout
+            )
+
+        def _perplexity_build(model: str) -> BaseLLMProvider:
+            return PerplexityProvider(
+                perplexity_key, model=model, timeout_seconds=timeout
+            )
+
+        def _anthropic_build(model: str) -> BaseLLMProvider:
+            return AnthropicProvider(
+                anthropic_key, model=model, timeout_seconds=timeout
+            )
+
+        def _gemini_build(model: str) -> BaseLLMProvider:
+            return GeminiProvider(
+                gemini_key, model=model, timeout_seconds=timeout
+            )
 
         provider_specs: dict[str, _ProviderSpec] = {
             "openai": _ProviderSpec(
                 name="openai",
-                factory=(
-                    (lambda: OpenAIProvider(
-                        openai_key,
-                        model=openai_model,
-                        timeout_seconds=timeout,
-                    ))
-                    if openai_key
-                    else (lambda: None)
-                ),
+                available=bool(openai_key),
+                default_model=openai_default_model,
+                build=_openai_build,
             ),
             "perplexity": _ProviderSpec(
                 name="perplexity",
-                factory=(
-                    (lambda: PerplexityProvider(
-                        perplexity_key,
-                        model=settings.PERPLEXITY_MODEL,
-                        timeout_seconds=timeout,
-                    ))
-                    if perplexity_key
-                    else (lambda: None)
+                available=bool(perplexity_key),
+                default_model=(
+                    settings.PERPLEXITY_DEFAULT_MODEL
+                    or settings.PERPLEXITY_MODEL
                 ),
+                build=_perplexity_build,
             ),
             "anthropic": _ProviderSpec(
                 name="anthropic",
-                factory=(
-                    (lambda: AnthropicProvider(
-                        anthropic_key,
-                        model=settings.ANTHROPIC_MODEL,
-                        timeout_seconds=timeout,
-                    ))
-                    if anthropic_key
-                    else (lambda: None)
-                ),
+                available=bool(anthropic_key),
+                default_model=settings.ANTHROPIC_MODEL,
+                build=_anthropic_build,
             ),
             "gemini": _ProviderSpec(
                 name="gemini",
-                factory=(
-                    (lambda: GeminiProvider(
-                        gemini_key,
-                        model=settings.GEMINI_MODEL,
-                        timeout_seconds=timeout,
-                    ))
-                    if gemini_key
-                    else (lambda: None)
-                ),
+                available=bool(gemini_key),
+                default_model=settings.GEMINI_MODEL,
+                build=_gemini_build,
             ),
         }
 
         choices: dict[str, str] = {}
+        agent_models: dict[str, Optional[str]] = {}
         for agent_name, field_name in AGENT_PROVIDER_FIELDS.items():
             raw = getattr(settings, field_name, "")
             choices[agent_name] = (raw or "").strip().lower()
+            try:
+                agent_models[agent_name] = settings.model_for_agent(agent_name)
+            except Exception:  # pragma: no cover - settings should not raise here
+                agent_models[agent_name] = None
 
         return cls(
             agent_provider_choice=choices,
+            agent_models=agent_models,
             provider_specs=provider_specs,
         )
 
     # ---- internal helpers -----------------------------------------
-    def _resolve_provider(self, name: str) -> Optional[BaseLLMProvider]:
-        if name in self._provider_cache:
-            return self._provider_cache[name]
-        spec = self._provider_specs.get(name)
-        if spec is None:
-            self._provider_cache[name] = None
-            return None
-        try:
-            instance = spec.factory()
-        except Exception as e:  # noqa: BLE001 - construction failures are non-fatal
-            self._log.warning(
-                "providers.construct_failed", provider=name, error=str(e)
-            )
-            instance = None
-        self._provider_cache[name] = instance
-        return instance
-
     def _disable(self, agent_name: str, **details: Any) -> None:
         # Single emit point so tests can patch ``log_disabled`` to
-        # observe disable reasons without scraping log output.
+        # observe disable reasons without scraping log output. We
+        # never log API keys — only ``provider``, ``model``, ``agent``,
+        # and the disable reason.
         details = {"agent": agent_name, **details}
         self._log.warning("providers.agent_disabled", **details)
         if self._log_disabled is not None:
@@ -306,14 +359,36 @@ class ProviderRouter:
             return None
         return choice
 
+    def model_for(self, agent_name: str) -> Optional[str]:
+        """Resolved model name for an agent, or ``None`` if disabled."""
+        return self._agent_models.get(agent_name)
+
     def provider_for(self, agent_name: str) -> Optional[BaseLLMProvider]:
         """Return a ready :class:`BaseLLMProvider` for an agent, or
         ``None`` if the agent is disabled / its key is missing /
         the provider name is unknown.
+
+        Resolution order:
+
+        1. **Per-agent cache** — already-built instance, possibly
+           overridden by a test.
+        2. **Provider-by-name cache** (``_provider_cache``) — legacy
+           back-compat hook: if a test set
+           ``router._provider_cache["openai"] = mock``, every agent
+           routed to OpenAI returns ``mock`` regardless of model
+           override. Tests rely on this.
+        3. **Lazy construct** — build a fresh provider with the
+           agent's resolved model, cache by agent.
         """
+        if agent_name in self._agent_provider_cache:
+            return self._agent_provider_cache[agent_name]
+
         choice = self.chosen_provider_name(agent_name)
         if choice is None:
-            self._disable(agent_name, reason="explicitly_disabled_or_unknown_agent")
+            self._disable(
+                agent_name, reason="explicitly_disabled_or_unknown_agent"
+            )
+            self._agent_provider_cache[agent_name] = None
             return None
         if choice not in self._provider_specs:
             self._disable(
@@ -322,14 +397,69 @@ class ProviderRouter:
                 requested=choice,
                 available=list(self._provider_specs),
             )
+            self._agent_provider_cache[agent_name] = None
             return None
-        provider = self._resolve_provider(choice)
-        if provider is None:
+
+        # Legacy back-compat: tests set ``_provider_cache[choice] = mock``
+        # to override every agent on that provider. Honor that without
+        # building a new instance.
+        legacy = self._provider_cache.get(choice)
+        if legacy is not None:
+            self._agent_provider_cache[agent_name] = legacy
+            return legacy
+
+        spec = self._provider_specs[choice]
+        if not spec.available:
             self._disable(
                 agent_name, reason="missing_api_key", provider=choice
             )
+            self._agent_provider_cache[agent_name] = None
+            # Tag the by-name cache so subsequent lookups for sibling
+            # agents on the same provider take the fast path.
+            self._provider_cache.setdefault(choice, None)
             return None
-        return provider
+
+        model = self._agent_models.get(agent_name) or spec.default_model
+        if not model:
+            # No model resolved (e.g. agent intentionally deterministic
+            # but routed by mistake). Disable rather than guess.
+            self._disable(
+                agent_name, reason="no_model_resolved", provider=choice
+            )
+            self._agent_provider_cache[agent_name] = None
+            return None
+
+        try:
+            instance: Optional[BaseLLMProvider] = spec.build(model)
+        except Exception as e:  # noqa: BLE001 - construction failures are non-fatal
+            # ``str(e)`` from a provider constructor never includes the
+            # API key (we control all four constructors), so this is
+            # safe to log.
+            self._log.warning(
+                "providers.construct_failed",
+                provider=choice,
+                model=model,
+                error=str(e),
+            )
+            instance = None
+
+        self._agent_provider_cache[agent_name] = instance
+        if instance is None:
+            self._disable(
+                agent_name,
+                reason="construct_failed",
+                provider=choice,
+                model=model,
+            )
+            return None
+
+        self._log.info(
+            "providers.agent_ready",
+            agent=agent_name,
+            provider=choice,
+            model=model,
+        )
+        return instance
 
     def client_for(self, agent_name: str) -> Optional[ProviderLLMClient]:
         """Return a legacy-shaped :class:`LLMClient` adapter for an agent.
@@ -363,23 +493,32 @@ class ProviderRouter:
         Returns ``{agent_name: {"provider": <name|None>,
         "enabled": bool, "model": <model_name|None>}}`` so the daily
         report or a status endpoint can show what's wired without
-        peeking into Settings.
+        peeking into Settings. Never includes API keys — only
+        provider names, model names, and a boolean enabled flag.
         """
         out: dict[str, dict[str, Any]] = {}
         for agent_name in self._choices:
             choice = self.chosen_provider_name(agent_name)
+            resolved_model = self._agent_models.get(agent_name)
             client = self.client_for(agent_name)
             out[agent_name] = {
                 "provider": choice,
                 "enabled": client is not None,
-                "model": client.model if client is not None else None,
+                "model": (
+                    client.model
+                    if client is not None
+                    else (resolved_model if choice is not None else None)
+                ),
             }
         return out
 
 
 __all__ = [
+    "AGENT_MODEL_FIELDS",
     "AGENT_PROVIDER_FIELDS",
+    "DISABLED_NAMES",
     "PROVIDER_NAMES",
+    "PROVIDERS_NEEDING_KEY",
     "ProviderLLMClient",
     "ProviderRouter",
 ]

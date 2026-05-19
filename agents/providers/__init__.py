@@ -35,21 +35,27 @@ from agents.providers.gemini_provider import GeminiProvider
 from agents.providers.openai_provider import OpenAIProvider
 from agents.providers.perplexity_provider import PerplexityProvider
 from agents.providers.router import (
+    AGENT_MODEL_FIELDS,
     AGENT_PROVIDER_FIELDS,
+    DISABLED_NAMES,
     PROVIDER_NAMES,
+    PROVIDERS_NEEDING_KEY,
     ProviderLLMClient,
     ProviderRouter,
 )
 
 __all__ = [
+    "AGENT_MODEL_FIELDS",
     "AGENT_PROVIDER_FIELDS",
     "AnthropicProvider",
     "BaseLLMProvider",
     "Citation",
+    "DISABLED_NAMES",
     "GeminiProvider",
     "OpenAIProvider",
     "PerplexityProvider",
     "PROVIDER_NAMES",
+    "PROVIDERS_NEEDING_KEY",
     "ProviderError",
     "ProviderJSONResult",
     "ProviderLLMClient",

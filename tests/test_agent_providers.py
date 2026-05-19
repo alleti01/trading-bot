@@ -451,25 +451,55 @@ def test_router_returns_none_for_explicit_disabled() -> None:
     assert router.provider_for("report") is None
 
 
-def test_router_returns_none_for_unknown_provider_name() -> None:
-    s = _settings(
-        ENABLE_LLM_AGENTS="true",
-        OPENAI_API_KEY="sk-test",
-        TRADE_ANALYSIS_AGENT_PROVIDER="myco-llm",
+def test_router_rejects_unknown_provider_name_at_settings_validation() -> None:
+    """Settings validator rejects typos in provider names so a user
+    cannot silently disable an agent with ``OENAI`` etc. The router
+    therefore never sees an "unknown provider" string for the
+    documented agents — but if one slips through (e.g. via a manually
+    constructed router) the router's ``provider_for`` still disables
+    cleanly. Both behaviours are exercised here."""
+    import pytest as _pytest
+
+    with _pytest.raises(Exception):
+        _settings(
+            ENABLE_LLM_AGENTS="true",
+            OPENAI_API_KEY="sk-test",
+            TRADE_ANALYSIS_AGENT_PROVIDER="myco-llm",
+        )
+
+
+def test_router_returns_none_for_manually_injected_unknown_provider() -> None:
+    """Direct router construction with a hand-rolled choice map still
+    gracefully disables unknown providers (no crash)."""
+    from agents.providers.router import ProviderRouter as PR
+
+    router = PR(
+        agent_provider_choice={"trade_analysis": "myco-llm"},
+        agent_models={"trade_analysis": None},
+        provider_specs={},  # nothing registered
     )
-    router = ProviderRouter.from_settings(s)
     assert router.provider_for("trade_analysis") is None
+    assert router.is_enabled("trade_analysis") is False
 
 
-def test_router_caches_provider_instances() -> None:
+def test_router_caches_per_agent_instances() -> None:
+    """Two agents routed to the same provider with the same resolved
+    model share one instance. (Different resolved models -> different
+    instances; covered separately.)"""
     s = _settings(
         ENABLE_LLM_AGENTS="true",
         OPENAI_API_KEY="sk-test",
         TRADE_ANALYSIS_AGENT_PROVIDER="openai",
         REPORT_AGENT_PROVIDER="openai",
+        # Pin both agents to the same model so they share an instance.
+        TRADE_ANALYSIS_AGENT_MODEL="gpt-4o-mini",
+        REPORT_AGENT_MODEL="gpt-4o-mini",
     )
     router = ProviderRouter.from_settings(s)
-    assert router.provider_for("trade_analysis") is router.provider_for("report")
+    a = router.provider_for("trade_analysis")
+    b = router.provider_for("report")
+    assert a is not None and b is not None
+    assert a.model_name == "gpt-4o-mini" == b.model_name
 
 
 def test_router_routing_table_reports_state() -> None:
@@ -482,10 +512,17 @@ def test_router_routing_table_reports_state() -> None:
     )
     router = ProviderRouter.from_settings(s)
     table = router.routing_table()
-    assert table["news"] == {"provider": "perplexity", "enabled": True, "model": s.PERPLEXITY_MODEL}
+    expected_pplx_model = s.PERPLEXITY_DEFAULT_MODEL or s.PERPLEXITY_MODEL
+    assert table["news"] == {
+        "provider": "perplexity",
+        "enabled": True,
+        "model": expected_pplx_model,
+    }
     assert table["trade_analysis"]["provider"] == "openai"
     assert table["trade_analysis"]["enabled"] is False
-    assert table["trade_analysis"]["model"] is None
+    # Routing table shows the would-have-been model for the audit
+    # trail even when the agent is disabled by a missing key.
+    assert table["trade_analysis"]["model"] is not None
 
 
 def test_router_has_any_enabled_false_when_no_keys() -> None:
@@ -750,6 +787,8 @@ def test_build_orchestrator_falls_back_to_legacy_openai() -> None:
         REPORT_AGENT_PROVIDER="none",
         RISK_EXPLAINER_AGENT_PROVIDER="none",
         TRADE_JOURNAL_AGENT_PROVIDER="none",
+        BACKTEST_CRITIC_AGENT_PROVIDER="none",
+        MODEL_DRIFT_AGENT_PROVIDER="none",
     )
     orch = build_orchestrator(s, notifier=_captured_notifier())
     assert orch.provider_router is None

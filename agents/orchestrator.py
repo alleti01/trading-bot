@@ -31,14 +31,26 @@ from typing import Any, Optional
 
 from sqlalchemy import select
 
+from agents.backtest_critic_agent import BacktestCriticAgent
 from agents.base_agent import AgentContext, BaseAgent
+from agents.data_quality_agent import DataQualityAgent
 from agents.llm_client import LLMClient
+from agents.macro_news_agent import MacroNewsAgent
+from agents.model_drift_agent import ModelDriftAgent
 from agents.model_review_agent import ModelReviewAgent
 from agents.news_agent import NewsAgent
 from agents.providers.router import ProviderRouter
 from agents.report_agent import ReportAgent
 from agents.risk_explainer_agent import RiskExplainerAgent
-from agents.schemas import AgentResult, NewsAssessment
+from agents.schemas import (
+    AgentResult,
+    DataQualityReport,
+    MacroNewsAssessment,
+    ModelDriftReport,
+    NewsAssessment,
+    StrategyResearchReport,
+)
+from agents.strategy_research_agent import StrategyResearchAgent
 from agents.trade_journal_agent import TradeJournalAgent
 from app.logging_config import get_logger
 from config.settings import Settings
@@ -295,6 +307,265 @@ class AgentOrchestrator:
                 n_valid=result.n_valid(),
                 n_total=result.n_total(),
             )
+        return result
+
+    # ------------------------------------------------------------------
+    # On-demand agent entry points (called by workflows / scheduler)
+    # ------------------------------------------------------------------
+    def run_macro_news(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        enabled_symbols: Optional[list[str]] = None,
+        news_headlines: Optional[list[str]] = None,
+    ) -> Optional[MacroNewsAssessment]:
+        """Run :class:`MacroNewsAgent` and update the high-risk-news flag.
+
+        Returns the validated :class:`MacroNewsAssessment` on success,
+        ``None`` if the agent is disabled / failed schema. ``high``
+        risk_level OR any populated ``blocked_windows`` flips the
+        ``high_risk_news_active`` flag — block-only.
+        """
+        client = self._client_for("macro_news")
+        if client is None:
+            self.log.info("agents.disabled", phase="macro_news")
+            return None
+        now = now or datetime.now(tz=timezone.utc)
+        sd = session_date(now, self.settings).isoformat()
+        symbols = list(enabled_symbols or [])
+        if not symbols:
+            symbols = list(getattr(self.settings, "ENABLED_SYMBOLS", []) or [])
+        if not symbols:
+            symbols = [self.settings.INSTRUMENT]
+        ctx = AgentContext(
+            settings_snapshot=self._settings_snapshot(),
+            session_date=sd,
+            instrument=self.settings.INSTRUMENT,
+            news_headlines=list(news_headlines or []),
+            enabled_symbols=symbols,
+        )
+        agent = MacroNewsAgent(client)
+        result = agent.run(ctx)
+        self._persist_result(result)
+        if not (result.schema_valid and result.payload):
+            self.log.warning(
+                "agents.macro_news.failed",
+                error=result.error,
+                keep_previous_flag=self._high_risk_news_active,
+            )
+            return None
+        try:
+            assessment = MacroNewsAssessment.model_validate(result.payload)
+        except Exception as e:  # noqa: BLE001
+            self.log.warning("agents.macro_news.bad_payload", error=str(e))
+            return None
+        # Filter affected_symbols to the operator-configured universe;
+        # the LLM is forbidden from inventing tickers and we enforce
+        # that here before the value reaches anything operational.
+        allowed = {s.upper() for s in symbols}
+        scoped = [s for s in assessment.affected_symbols if s.upper() in allowed]
+        flag = (
+            assessment.risk_level == "high"
+            or bool(assessment.blocked_windows)
+        )
+        self._high_risk_news_active = bool(flag)
+        self.log.info(
+            "agents.macro_news.flag_set",
+            high_risk_news_active=self._high_risk_news_active,
+            risk_level=assessment.risk_level,
+            affected_symbols=scoped,
+        )
+        if flag:
+            self._safe_notify(
+                "high_risk_news",
+                source="macro_news",
+                risk_level=assessment.risk_level,
+                affected_symbols=scoped,
+                summary=assessment.summary,
+            )
+        return assessment
+
+    def run_data_quality_check(
+        self,
+        feeds_by_symbol: Optional[dict[str, Any]] = None,
+        *,
+        precomputed: Optional[dict[str, Any]] = None,
+        now: Optional[datetime] = None,
+    ) -> Optional[DataQualityReport]:
+        """Run the deterministic :class:`DataQualityAgent` pre-paper hook.
+
+        Two paths:
+
+        - ``feeds_by_symbol`` (mapping symbol -> OHLCV DataFrame) is
+          the typical paper-mode pre-flight call.
+        - ``precomputed`` is used when the scan has already been
+          performed elsewhere (e.g. by the scheduler) and we just
+          want to persist + notify.
+
+        Returns the validated :class:`DataQualityReport` on success,
+        ``None`` on failure. The orchestrator does not raise — paper
+        mode reads ``report.blocked_symbols`` from the return value.
+        """
+        agent = DataQualityAgent()
+        if feeds_by_symbol is not None:
+            now_utc = (now or datetime.now(tz=timezone.utc))
+            sd = session_date(now_utc, self.settings).isoformat()
+            result = agent.run_with_feeds(
+                feeds_by_symbol,
+                now=now_utc,
+                session_date=sd,
+            )
+        else:
+            ctx = AgentContext(
+                settings_snapshot=self._settings_snapshot(),
+                session_date=(
+                    session_date(
+                        now or datetime.now(tz=timezone.utc), self.settings
+                    ).isoformat()
+                ),
+                instrument=self.settings.INSTRUMENT,
+                data_quality=precomputed,
+            )
+            result = agent.run(ctx)
+
+        self._persist_result(result)
+        if not (result.schema_valid and result.payload):
+            return None
+        try:
+            report = DataQualityReport.model_validate(result.payload)
+        except Exception as e:  # noqa: BLE001
+            self.log.warning(
+                "agents.data_quality.bad_payload", error=str(e)
+            )
+            return None
+        if report.blocked_symbols:
+            self._safe_notify(
+                "data_quality.blocked",
+                blocked=list(report.blocked_symbols),
+                checked=list(report.checked_symbols),
+                summary=report.summary,
+            )
+        return report
+
+    def run_model_drift_review(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        paper_metrics: Optional[dict[str, Any]] = None,
+    ) -> Optional[ModelDriftReport]:
+        """Run :class:`ModelDriftAgent` (stats-first, optional LLM narrative).
+
+        Used by daily / weekly reviews. The deterministic stats path
+        runs even when no LLM is configured for ``model_drift``.
+        """
+        now = now or datetime.now(tz=timezone.utc)
+        sd = session_date(now, self.settings).isoformat()
+        observed = (
+            paper_metrics
+            if paper_metrics is not None
+            else build_daily_report_payload(self.settings, now=now).get(
+                "metrics"
+            )
+        )
+        ctx = AgentContext(
+            settings_snapshot=self._settings_snapshot(),
+            session_date=sd,
+            instrument=self.settings.INSTRUMENT,
+            paper_metrics=observed,
+            model_metadata=self._load_latest_model_metadata(now=now),
+        )
+        # LLM polish is optional; ``client_for`` returning ``None`` is
+        # the normal "stats-only" path and not an error.
+        client = self._client_for("model_drift")
+        agent = ModelDriftAgent(client)
+        result = agent.run(ctx)
+        self._persist_result(result)
+        if not (result.schema_valid and result.payload):
+            return None
+        try:
+            report = ModelDriftReport.model_validate(result.payload)
+        except Exception as e:  # noqa: BLE001
+            self.log.warning(
+                "agents.model_drift.bad_payload", error=str(e)
+            )
+            return None
+        if report.severity in ("warn", "alert"):
+            self._safe_notify(
+                "model_drift",
+                severity=report.severity,
+                retrain_recommended=report.retrain_recommended,
+                reason=report.reason,
+            )
+        return report
+
+    def run_strategy_research(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        backtest_summary: Optional[dict[str, Any]] = None,
+        enabled_symbols: Optional[list[str]] = None,
+    ) -> Optional[StrategyResearchReport]:
+        """Run :class:`StrategyResearchAgent` for off-cycle ideation."""
+        client = self._client_for("strategy_research")
+        if client is None:
+            self.log.info("agents.disabled", phase="strategy_research")
+            return None
+        now = now or datetime.now(tz=timezone.utc)
+        sd = session_date(now, self.settings).isoformat()
+        symbols = list(enabled_symbols or []) or list(
+            getattr(self.settings, "ENABLED_SYMBOLS", [])
+            or [self.settings.INSTRUMENT]
+        )
+        ctx = AgentContext(
+            settings_snapshot=self._settings_snapshot(),
+            session_date=sd,
+            instrument=self.settings.INSTRUMENT,
+            backtest_summary=backtest_summary or {},
+            enabled_symbols=symbols,
+        )
+        agent = StrategyResearchAgent(client)
+        result = agent.run(ctx)
+        self._persist_result(result)
+        if not (result.schema_valid and result.payload):
+            return None
+        try:
+            return StrategyResearchReport.model_validate(result.payload)
+        except Exception as e:  # noqa: BLE001
+            self.log.warning(
+                "agents.strategy_research.bad_payload", error=str(e)
+            )
+            return None
+
+    def run_backtest_critic(
+        self,
+        backtest_summary: dict[str, Any],
+        *,
+        now: Optional[datetime] = None,
+    ) -> Optional[AgentResult]:
+        """Run :class:`BacktestCriticAgent` on a freshly-completed backtest.
+
+        Returns the raw :class:`AgentResult` so callers can inspect
+        the validated payload (with weak spots + experiment list) or
+        the validation error. None when the agent is disabled.
+        """
+        client = self._client_for("backtest_critic")
+        if client is None:
+            self.log.info("agents.disabled", phase="backtest_critic")
+            return None
+        now = now or datetime.now(tz=timezone.utc)
+        sd = session_date(now, self.settings).isoformat()
+        daily = build_daily_report_payload(self.settings, now=now) or {}
+        ctx = AgentContext(
+            settings_snapshot=self._settings_snapshot(),
+            session_date=sd,
+            instrument=self.settings.INSTRUMENT,
+            backtest_summary=backtest_summary or {},
+            paper_metrics=daily.get("metrics"),
+            daily_report=daily,
+        )
+        agent = BacktestCriticAgent(client)
+        result = agent.run(ctx)
+        self._persist_result(result)
         return result
 
     # ------------------------------------------------------------------

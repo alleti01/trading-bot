@@ -133,13 +133,19 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: Optional[SecretStr] = None
     GEMINI_API_KEY: Optional[SecretStr] = None
 
-    # ---- Per-provider model overrides --------------------------------
-    # Each provider has a sensible default; operators can override
-    # without recompiling. ``LLM_MODEL`` is kept for back-compat and
-    # acts as the default for the OpenAI provider when
-    # ``OPENAI_MODEL`` is not set.
+    # ---- Per-provider default models ---------------------------------
+    # Plain "default for the whole provider" — used when an agent has
+    # no per-agent override. ``OPENAI_MODEL`` (legacy) and
+    # ``OPENAI_DEFAULT_MODEL`` are aliases; the router prefers
+    # ``OPENAI_DEFAULT_MODEL`` when set.
     OPENAI_MODEL: Optional[str] = None
+    OPENAI_DEFAULT_MODEL: str = "gpt-4o-mini"
+    # Stronger model used by review/audit agents (model_review,
+    # backtest_critic). Operators can change this string when the
+    # available model catalog changes.
+    OPENAI_REVIEW_MODEL: str = "gpt-4o"
     PERPLEXITY_MODEL: str = "sonar"
+    PERPLEXITY_DEFAULT_MODEL: str = "sonar-pro"
     ANTHROPIC_MODEL: str = "claude-3-5-sonnet-latest"
     GEMINI_MODEL: str = "gemini-1.5-flash"
 
@@ -147,8 +153,10 @@ class Settings(BaseSettings):
     # The router reads these to decide which provider executes each
     # advisory agent. Web-grounded research (news, macro, strategy)
     # defaults to Perplexity; reasoning/summarization defaults to
-    # OpenAI. Set to "none" / "disabled" to switch an agent off
-    # without removing it from the orchestrator.
+    # OpenAI. Set to "none" / "disabled" / "off" to switch an agent
+    # off without removing it from the orchestrator. Validators below
+    # reject any other value with a clear error so a typo cannot
+    # silently disable a critical agent.
     NEWS_AGENT_PROVIDER: str = "perplexity"
     MACRO_NEWS_AGENT_PROVIDER: str = "perplexity"
     STRATEGY_RESEARCH_AGENT_PROVIDER: str = "perplexity"
@@ -157,6 +165,37 @@ class Settings(BaseSettings):
     REPORT_AGENT_PROVIDER: str = "openai"
     RISK_EXPLAINER_AGENT_PROVIDER: str = "openai"
     TRADE_JOURNAL_AGENT_PROVIDER: str = "openai"
+    # ``BacktestCriticAgent`` always runs an LLM (default OpenAI).
+    # ``ModelDriftAgent`` runs deterministic stats and uses the LLM
+    # only for an optional narrative — default ``"none"`` keeps the
+    # bot offline-clean. ``DataQualityAgent`` is fully deterministic.
+    BACKTEST_CRITIC_AGENT_PROVIDER: str = "openai"
+    MODEL_DRIFT_AGENT_PROVIDER: str = "none"
+    DATA_QUALITY_AGENT_PROVIDER: str = "none"
+
+    # ---- Per-agent model overrides -----------------------------------
+    # Operator can override which exact model each agent uses. ``None``
+    # / empty / ``${OPENAI_DEFAULT_MODEL}`` / ``${OPENAI_REVIEW_MODEL}``
+    # / ``${PERPLEXITY_DEFAULT_MODEL}`` are all interpreted as "inherit
+    # the right default for this agent" — see ``model_for_agent``.
+    NEWS_AGENT_MODEL: Optional[str] = None
+    MACRO_NEWS_AGENT_MODEL: Optional[str] = None
+    # Heavier research model; default ``sonar-deep-research`` is
+    # spec'd for weekly use (slow / expensive). Operators may want to
+    # downgrade to ``sonar-pro`` for daily runs.
+    STRATEGY_RESEARCH_AGENT_MODEL: Optional[str] = "sonar-deep-research"
+    TRADE_ANALYSIS_AGENT_MODEL: Optional[str] = None
+    MODEL_REVIEW_AGENT_MODEL: Optional[str] = None
+    REPORT_AGENT_MODEL: Optional[str] = None
+    RISK_EXPLAINER_AGENT_MODEL: Optional[str] = None
+    TRADE_JOURNAL_AGENT_MODEL: Optional[str] = None
+    BACKTEST_CRITIC_AGENT_MODEL: Optional[str] = None
+    # Default ``"none"`` — deterministic stats only. Set to a real
+    # model name AND set ``MODEL_DRIFT_AGENT_PROVIDER=openai`` to
+    # enable the optional narrative polish.
+    MODEL_DRIFT_AGENT_MODEL: Optional[str] = "none"
+    # ``DataQualityAgent`` never calls an LLM by default.
+    DATA_QUALITY_AGENT_MODEL: Optional[str] = "none"
 
     # ---- Notifications -------------------------------------------------
     DISCORD_WEBHOOK_URL: Optional[SecretStr] = None
@@ -263,6 +302,44 @@ class Settings(BaseSettings):
             raise ValueError(f"Invalid LOG_LEVEL '{v}'")
         return v
 
+    @field_validator(
+        "NEWS_AGENT_PROVIDER",
+        "MACRO_NEWS_AGENT_PROVIDER",
+        "STRATEGY_RESEARCH_AGENT_PROVIDER",
+        "TRADE_ANALYSIS_AGENT_PROVIDER",
+        "MODEL_REVIEW_AGENT_PROVIDER",
+        "REPORT_AGENT_PROVIDER",
+        "RISK_EXPLAINER_AGENT_PROVIDER",
+        "TRADE_JOURNAL_AGENT_PROVIDER",
+        "BACKTEST_CRITIC_AGENT_PROVIDER",
+        "MODEL_DRIFT_AGENT_PROVIDER",
+        "DATA_QUALITY_AGENT_PROVIDER",
+    )
+    @classmethod
+    def _normalize_agent_provider(cls, v: str) -> str:
+        # Lowercase + validate. ``""`` / unset is treated as ``"none"``
+        # (agent disabled) so a typo like ``MODEL_DRIFT_AGENT_PROVIDER=``
+        # never falls through to "openai" silently.
+        s = (v or "").strip().lower()
+        if s == "":
+            s = "none"
+        allowed = {
+            "openai",
+            "perplexity",
+            "anthropic",
+            "gemini",
+            "none",
+            "off",
+            "disabled",
+            "false",
+        }
+        if s not in allowed:
+            raise ValueError(
+                f"Invalid agent provider '{v}'. Allowed: "
+                f"{sorted(allowed)}. Use 'none' to disable an agent."
+            )
+        return s
+
     @model_validator(mode="after")
     def _refuse_live_without_adapter(self) -> "Settings":
         if self.MODE == "LIVE" and not self.LIVE_ADAPTER_CONFIRMED:
@@ -300,6 +377,76 @@ class Settings(BaseSettings):
 
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.TIMEZONE)
+
+    # ----------------------------------------------------------------------
+    # Agent provider/model accessors
+    # ----------------------------------------------------------------------
+    # Tokens we treat as "use the per-provider default" inside per-agent
+    # model fields. ``${...}`` shorthand exists so ``.env.example`` can
+    # show that a per-agent model "ties to" a default without actually
+    # requiring pydantic-settings env-var interpolation (which does not
+    # exist by default). Plain empty / "none" / None all behave the
+    # same way.
+    _MODEL_DEFAULT_TOKENS = {
+        "",
+        "none",
+        "off",
+        "disabled",
+        "false",
+        "${openai_default_model}",
+        "${openai_review_model}",
+        "${perplexity_default_model}",
+    }
+
+    # Agents that ride the heavier review / audit OpenAI model when no
+    # explicit per-agent override is set. Everything else (writing,
+    # narrative summaries) takes the default OpenAI model.
+    _OPENAI_REVIEW_AGENTS = frozenset({"model_review", "backtest_critic"})
+
+    def _resolve_default_model(self, agent_name: str, provider: str) -> Optional[str]:
+        """Return the provider-default model for an agent, or ``None``
+        when the agent is disabled / deterministic."""
+        if provider in {"none", "off", "disabled", "false", ""}:
+            return None
+        if provider == "openai":
+            if agent_name in self._OPENAI_REVIEW_AGENTS:
+                return self.OPENAI_REVIEW_MODEL
+            # Honor the legacy ``OPENAI_MODEL`` if explicitly set,
+            # otherwise the new ``OPENAI_DEFAULT_MODEL``.
+            return self.OPENAI_MODEL or self.OPENAI_DEFAULT_MODEL
+        if provider == "perplexity":
+            return self.PERPLEXITY_DEFAULT_MODEL or self.PERPLEXITY_MODEL
+        if provider == "anthropic":
+            return self.ANTHROPIC_MODEL
+        if provider == "gemini":
+            return self.GEMINI_MODEL
+        return None
+
+    def model_for_agent(self, agent_name: str) -> Optional[str]:
+        """Resolve the model an agent should run with.
+
+        - If the per-agent ``*_AGENT_MODEL`` override is set to a real
+          string, use it.
+        - If unset / empty / ``"none"`` / a ``${...}`` shorthand,
+          inherit the right default for that agent's provider.
+        - If the agent's provider is ``"none"`` (disabled or
+          deterministic), return ``None`` so the router builds nothing.
+        """
+        provider = (
+            getattr(self, f"{agent_name.upper()}_AGENT_PROVIDER", "none")
+            or "none"
+        ).lower()
+        raw = getattr(self, f"{agent_name.upper()}_AGENT_MODEL", None)
+        token = (raw or "").strip().lower()
+        if token not in self._MODEL_DEFAULT_TOKENS:
+            return raw
+        return self._resolve_default_model(agent_name, provider)
+
+    def provider_for_agent(self, agent_name: str) -> str:
+        """Lowercased provider name for an agent. Always returns
+        a string ('none' when off)."""
+        raw = getattr(self, f"{agent_name.upper()}_AGENT_PROVIDER", "none")
+        return (raw or "none").strip().lower() or "none"
 
 
 # A simple module-level cache. ``reload_settings`` is provided so tests and
