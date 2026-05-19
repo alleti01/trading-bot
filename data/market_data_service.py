@@ -18,6 +18,15 @@ incremental feeds available are:
 
 Both maintain a rolling in-memory window so the loop can recompute
 features without reading the entire history every tick.
+
+Multi-symbol mode (this revision) adds:
+
+- :func:`resolve_symbol_csv_paths`   — convention-based ``data/historical/<SYM>/<TF>.csv``
+  lookup, returning per-symbol paths plus the list of symbols whose
+  data is missing (so the orchestrator can disable just those rather
+  than crashing the whole bot).
+- :func:`build_per_symbol_feeds`     — convenience builder that returns a
+  ``dict[symbol, IncrementalFeed]`` for a :class:`SymbolUniverse`.
 """
 
 from __future__ import annotations
@@ -282,3 +291,80 @@ class SyntheticLiveFeed(IncrementalFeed):
         self._n_emitted += 1
 
         return PollResult(new_candle=candle, rolling_window=self._build_window())
+
+
+# ---------------------------------------------------------------------------
+# Multi-symbol helpers
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class PerSymbolFeedPlan:
+    """Plan + diagnostics for building per-symbol feeds.
+
+    ``feeds`` are ready-to-poll incremental feeds keyed by symbol.
+    ``missing`` lists symbols whose data file could not be located —
+    the orchestrator should flag them as disabled rather than abort.
+    ``failed`` lists symbols whose file existed but failed to load
+    (corrupt CSV, schema mismatch); same handling.
+    """
+
+    feeds: dict[str, "IncrementalFeed"]
+    missing: list[str]
+    failed: dict[str, str]
+
+
+def resolve_symbol_csv_paths(
+    symbols: list[str],
+    *,
+    base_dir: Path | str,
+    timeframe: str = "1m",
+) -> tuple[dict[str, Path], list[str]]:
+    """Convention: ``<base_dir>/<SYMBOL>/<timeframe>.csv``.
+
+    Returns a ``(found, missing)`` tuple. ``missing`` lists symbols
+    whose CSV does not exist on disk.
+    """
+    base = Path(base_dir)
+    found: dict[str, Path] = {}
+    missing: list[str] = []
+    for sym in symbols:
+        candidate = base / sym.upper() / f"{timeframe}.csv"
+        if candidate.is_file():
+            found[sym.upper()] = candidate
+        else:
+            missing.append(sym.upper())
+    return found, missing
+
+
+def build_per_symbol_feeds(
+    symbols: list[str],
+    *,
+    base_dir: Path | str,
+    timeframe: str = "1m",
+    tz: str,
+    window_bars: int = 500,
+    warmup_bars: int = 0,
+) -> PerSymbolFeedPlan:
+    """Build :class:`RollingCSVFeed` per symbol from the convention path.
+
+    A per-symbol load failure does NOT abort — it lands in
+    :attr:`PerSymbolFeedPlan.failed` so the orchestrator can disable
+    just that symbol.
+    """
+    found, missing = resolve_symbol_csv_paths(
+        symbols, base_dir=base_dir, timeframe=timeframe
+    )
+    feeds: dict[str, IncrementalFeed] = {}
+    failed: dict[str, str] = {}
+    for sym, path in found.items():
+        try:
+            feeds[sym] = RollingCSVFeed(
+                path=path,
+                instrument=sym,
+                timeframe=timeframe,
+                tz=tz,
+                window_bars=window_bars,
+                warmup_bars=warmup_bars,
+            )
+        except Exception as e:  # noqa: BLE001 - preserve detail, isolate
+            failed[sym] = str(e)
+    return PerSymbolFeedPlan(feeds=feeds, missing=missing, failed=failed)

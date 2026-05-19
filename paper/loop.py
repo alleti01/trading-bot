@@ -12,14 +12,22 @@ Pipeline (executed every ``on_bar_close`` call):
    "no-lookahead" property: any setup older than the latest bar would
    already have been considered on a previous tick.
 5. Optional model gate.
-6. Risk engine — authoritative. Blocked setups are persisted as
+6. Optional entry gate (multi-symbol caps).
+7. Risk engine — authoritative. Blocked setups are persisted as
    ``risk_blocks`` rows and skipped.
-7. Size + submit through :class:`PaperExecutor`. Sizing failures are
+8. Size + submit through :class:`PaperExecutor`. Sizing failures are
    recorded as risk blocks (defensive — should be rare).
 
 A separate ``flatten_now()`` is exposed so the scheduler's end-of-day job
 can force-flat any straggler position even if no new bar has arrived yet
 (e.g. data feed went quiet around the close).
+
+Multi-symbol mode (this revision) adds :class:`MultiSymbolPaperLoop`
+which composes one :class:`PaperTradingLoop` per symbol behind a single
+``on_bar_close`` entry point and threads an ``entry_gate`` callback into
+each so per-symbol day caps, the global day cap, and ``MAX_ACTIVE_SYMBOLS``
+are enforced before any submit. Per-symbol failures are isolated — a
+broken feed for ``MNQ`` cannot stop ``MES`` from running.
 """
 
 from __future__ import annotations
@@ -154,6 +162,10 @@ class PaperTradingLoop:
         kill_switch: Optional[KillSwitch] = None,
         max_hold_bars: Optional[int] = None,
         high_risk_news_fn: Optional[Callable[[], bool]] = None,
+        instrument: Optional[str] = None,
+        entry_gate: Optional[
+            Callable[[Setup, Optional[float]], "tuple[bool, str]"]
+        ] = None,
     ) -> None:
         # Accept either a single ``strategy=`` (the original API) or a
         # list ``strategies=`` (multi-strategy paper mode). Internally
@@ -175,7 +187,14 @@ class PaperTradingLoop:
         self.feed = feed
         self.notifier = notifier
         self.predictor = predictor
-        self.spec = get_instrument(settings.INSTRUMENT)
+        # Multi-symbol mode threads a per-symbol instrument in; default
+        # falls back to the legacy single-symbol settings.INSTRUMENT.
+        self.instrument: str = (instrument or settings.INSTRUMENT).upper()
+        self.spec = get_instrument(self.instrument)
+        # Optional cap-enforcement gate; default = always allow.
+        self._entry_gate: Callable[[Setup, Optional[float]], "tuple[bool, str]"] = (
+            entry_gate or (lambda _setup, _conf: (True, ""))
+        )
         self.portfolio = portfolio or Portfolio(instrument_spec=self.spec)
         self.kill_switch = kill_switch or KillSwitch()
         self.fills = make_fills_model(
@@ -444,11 +463,11 @@ class PaperTradingLoop:
         # idempotent and respects no-lookahead; recomputing here is fine
         # for Day 5 sizes (a few hundred bars).
         rolling = rolling_window.copy()
-        rolling["instrument"] = self.settings.INSTRUMENT
+        rolling["instrument"] = self.instrument
         rolling["timeframe"] = "1m"
         try:
             features = build_features(
-                rolling, instrument=self.settings.INSTRUMENT, tz=self.settings.TIMEZONE
+                rolling, instrument=self.instrument, tz=self.settings.TIMEZONE
             )
         except Exception as e:
             self._record_error(result, "features.failed", e)
@@ -582,6 +601,35 @@ class PaperTradingLoop:
             if not pred.approved:
                 result.setups_model_rejected += 1
                 return
+
+        # Multi-symbol entry gate (caps). Default gate always allows;
+        # ``MultiSymbolPaperLoop`` swaps in a real gate that enforces
+        # per-symbol day cap, total day cap, and MAX_ACTIVE_SYMBOLS.
+        # A blocked candidate is recorded as a risk_block for audit
+        # parity with deterministic risk decisions.
+        try:
+            allow, gate_rule = self._entry_gate(setup, confidence_for_trade)
+        except Exception as e:
+            self.log.warning("loop.entry_gate_failed", error=str(e))
+            allow, gate_rule = True, ""
+        if not allow:
+            from risk.risk_engine import RiskDecision  # local import: avoid cycle
+
+            decision = RiskDecision(
+                allowed=False,
+                rule=gate_rule or "multi_symbol_cap",
+                reason="Multi-symbol cap exceeded; setup not submitted.",
+            )
+            self._persist_risk_block(setup, decision, now)
+            self.notifier.notify(
+                "trade.blocked",
+                instrument=setup.instrument,
+                direction=setup.direction,
+                rule=decision.rule,
+                reason=decision.reason,
+            )
+            result.setups_risk_blocked += 1
+            return
 
         # Risk engine. The high-risk news flag is *block-only* — the
         # NewsAgent (or any other source) can flip it via the callback,
@@ -749,6 +797,272 @@ class PaperTradingLoop:
 
 
 # ---------------------------------------------------------------------------
+# Multi-symbol orchestrator
+# ---------------------------------------------------------------------------
+@dataclass
+class MultiSymbolBarResult:
+    """Aggregate per-symbol :class:`BarCycleResult`, per-tick.
+
+    The scheduler treats this as a drop-in replacement for the
+    single-symbol :class:`BarCycleResult` so it doesn't need to know
+    whether the bot is running 1 or 6 symbols. Convenience accessors
+    summarize across the per-symbol entries.
+    """
+
+    by_symbol: dict[str, BarCycleResult] = field(default_factory=dict)
+
+    @property
+    def new_bar(self) -> bool:
+        return any(r.new_bar for r in self.by_symbol.values())
+
+    @property
+    def setups_seen(self) -> int:
+        return sum(r.setups_seen for r in self.by_symbol.values())
+
+    @property
+    def setups_filled(self) -> int:
+        return sum(r.setups_filled for r in self.by_symbol.values())
+
+    @property
+    def setups_risk_blocked(self) -> int:
+        return sum(r.setups_risk_blocked for r in self.by_symbol.values())
+
+    @property
+    def setups_model_rejected(self) -> int:
+        return sum(r.setups_model_rejected for r in self.by_symbol.values())
+
+    @property
+    def exits(self) -> int:
+        return sum(r.exits for r in self.by_symbol.values())
+
+    @property
+    def errors(self) -> list[str]:
+        flat: list[str] = []
+        for sym, r in self.by_symbol.items():
+            flat.extend(f"{sym}:{e}" for e in r.errors)
+        return flat
+
+
+class MultiSymbolPaperLoop:
+    """Compose N per-symbol :class:`PaperTradingLoop` instances.
+
+    Public API mirrors the single-symbol loop (``on_bar_close``,
+    ``flatten_now``, ``set_trade_closed_callback``, ``trading_enabled``)
+    so the scheduler is unchanged.
+
+    Caps enforced at the orchestrator level via the ``entry_gate`` we
+    inject into each per-symbol loop:
+
+    - ``MAX_TRADES_PER_SYMBOL_PER_DAY`` — fills per (session_date, symbol)
+    - ``MAX_TOTAL_TRADES_PER_DAY`` — fills per session_date across all
+      symbols
+    - ``MAX_ACTIVE_SYMBOLS`` — count of per-symbol loops currently
+      holding an open position; new entries refused beyond this cap.
+
+    Per-symbol loops are independent: a feed failure or a strategy
+    crash on one symbol cannot affect any other.
+    """
+
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        loops: dict[str, PaperTradingLoop],
+        notifier: _NotifierLike,
+        disabled_symbols: Optional[dict[str, str]] = None,
+    ) -> None:
+        if not loops:
+            raise ValueError("MultiSymbolPaperLoop requires at least one loop")
+        self.settings = settings
+        self.notifier = notifier
+        self._loops: dict[str, PaperTradingLoop] = {
+            sym.upper(): loop for sym, loop in loops.items()
+        }
+        self.disabled_symbols: dict[str, str] = dict(disabled_symbols or {})
+        # Per-(session_date, symbol) counters. Reset lazily when the
+        # session_date observed at gate-call time changes.
+        self._fills_by_day: dict[str, dict[str, int]] = {}
+        self.log = get_logger("paper.multi_symbol")
+        # Wire the cap-enforcement gate into each per-symbol loop. Done
+        # here (not by the loop builder) so the gate can read shared
+        # state across all loops.
+        for sym, loop in self._loops.items():
+            loop._entry_gate = self._make_gate_for(sym)
+            # Attach a post-fill hook so the orchestrator counts fills.
+            self._patch_fill_counter(sym, loop)
+
+    @property
+    def trading_enabled(self) -> bool:
+        # Aggregate: orchestrator is "trading_enabled" if any per-symbol
+        # loop is. The scheduler reads this before forwarding bars.
+        return any(loop.trading_enabled for loop in self._loops.values())
+
+    @trading_enabled.setter
+    def trading_enabled(self, value: bool) -> None:
+        for loop in self._loops.values():
+            loop.trading_enabled = bool(value)
+
+    @property
+    def strategies(self) -> list[Strategy]:
+        # Convenience for the scheduler/test tooling: return strategies
+        # of the primary loop. Real per-symbol strategies are owned by
+        # each ``PaperTradingLoop``.
+        first = next(iter(self._loops.values()))
+        return list(first.strategies)
+
+    # ------------------------------------------------------------------
+    # Public scheduler-facing API
+    # ------------------------------------------------------------------
+    def on_bar_close(self, now: datetime) -> MultiSymbolBarResult:
+        """Forward a tick to every enabled symbol's loop.
+
+        Per-symbol failures are isolated: an exception from one loop
+        is captured into its result and never raised. If a symbol is
+        disabled (e.g. its CSV failed to load) it stays disabled for
+        the lifetime of the orchestrator.
+        """
+        out = MultiSymbolBarResult()
+        for sym, loop in self._loops.items():
+            if sym in self.disabled_symbols:
+                out.by_symbol[sym] = BarCycleResult(
+                    new_bar=False,
+                    trading_enabled=False,
+                    errors=[f"disabled:{self.disabled_symbols[sym]}"],
+                )
+                continue
+            try:
+                out.by_symbol[sym] = loop.on_bar_close(now)
+            except Exception as e:  # noqa: BLE001 - isolate per-symbol crashes
+                self.log.error("multi_symbol.loop_failed", symbol=sym, error=str(e))
+                out.by_symbol[sym] = BarCycleResult(
+                    new_bar=False,
+                    trading_enabled=False,
+                    errors=[f"loop_failed:{e}"],
+                )
+        return out
+
+    def flatten_now(self, now: datetime, *, reason: str = "forced_flat") -> bool:
+        """Force-flat every per-symbol loop. Returns True if any closed."""
+        any_closed = False
+        for sym, loop in self._loops.items():
+            try:
+                if loop.flatten_now(now, reason=reason):
+                    any_closed = True
+            except Exception as e:  # noqa: BLE001
+                self.log.warning(
+                    "multi_symbol.flatten_failed", symbol=sym, error=str(e)
+                )
+        return any_closed
+
+    def set_trade_closed_callback(self, callback) -> None:
+        """Fan-out the post-trade analysis hook to every loop."""
+        for loop in self._loops.values():
+            loop.set_trade_closed_callback(callback)
+
+    def loop_for(self, symbol: str) -> PaperTradingLoop:
+        """Lookup helper for tests / introspection."""
+        return self._loops[symbol.upper()]
+
+    def symbols(self) -> list[str]:
+        return sorted(self._loops)
+
+    def open_position_symbols(self) -> list[str]:
+        return [
+            sym for sym, loop in self._loops.items()
+            if loop.portfolio.open_position is not None
+        ]
+
+    # ------------------------------------------------------------------
+    # Caps
+    # ------------------------------------------------------------------
+    def _session_key(self, now: Optional[datetime]) -> str:
+        # Use the trading-window timezone for "today" so caps reset on
+        # the operator's session boundary, not UTC midnight.
+        from scheduler.market_hours import session_date  # local import to avoid cycle
+
+        ts = now or datetime.now(timezone.utc)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return session_date(ts, self.settings).isoformat()
+
+    def _counters_for_today(self, now: Optional[datetime]) -> dict[str, int]:
+        key = self._session_key(now)
+        if key not in self._fills_by_day:
+            # Drop older keys so the dict doesn't grow unbounded over a
+            # multi-week run.
+            self._fills_by_day = {key: {}}
+        return self._fills_by_day[key]
+
+    def _make_gate_for(self, symbol: str):
+        per_symbol_cap = min(
+            int(self.settings.MAX_TRADES_PER_SYMBOL_PER_DAY),
+            int(self.settings.MAX_TRADES_PER_DAY),
+        )
+        total_cap = int(self.settings.MAX_TOTAL_TRADES_PER_DAY)
+        active_cap = int(self.settings.MAX_ACTIVE_SYMBOLS)
+
+        def _gate(setup: Setup, _confidence: Optional[float]) -> tuple[bool, str]:
+            counters = self._counters_for_today(getattr(setup, "timestamp", None))
+            sym_count = counters.get(symbol, 0)
+            total = sum(counters.values())
+
+            if sym_count >= per_symbol_cap:
+                self.log.info(
+                    "multi_symbol.cap_blocked",
+                    rule="per_symbol_day_cap",
+                    symbol=symbol,
+                    sym_count=sym_count,
+                    cap=per_symbol_cap,
+                )
+                return False, "per_symbol_day_cap"
+            if total >= total_cap:
+                self.log.info(
+                    "multi_symbol.cap_blocked",
+                    rule="total_day_cap",
+                    symbol=symbol,
+                    total=total,
+                    cap=total_cap,
+                )
+                return False, "total_day_cap"
+            n_active = len(self.open_position_symbols())
+            sym_already_active = symbol in self.open_position_symbols()
+            if not sym_already_active and n_active >= active_cap:
+                self.log.info(
+                    "multi_symbol.cap_blocked",
+                    rule="max_active_symbols",
+                    symbol=symbol,
+                    active=n_active,
+                    cap=active_cap,
+                )
+                return False, "max_active_symbols"
+            return True, ""
+
+        return _gate
+
+    def _patch_fill_counter(self, symbol: str, loop: PaperTradingLoop) -> None:
+        """Wrap the loop's notifier so we can observe ``trade.opened`` events.
+
+        We don't change the loop's internals; we just intercept the
+        notifier so any successful submit increments the per-symbol
+        counter for today's session.
+        """
+        original_notifier = loop.notifier
+        orchestrator = self
+
+        class _CountingNotifier:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def notify(self, kind: str, /, **payload):
+                if kind == "trade.opened":
+                    counters = orchestrator._counters_for_today(None)
+                    counters[symbol] = counters.get(symbol, 0) + 1
+                return self._inner.notify(kind, **payload)
+
+        loop.notifier = _CountingNotifier(original_notifier)
+
+
+# ---------------------------------------------------------------------------
 # Loop builder — used by main.py and the scheduler
 # ---------------------------------------------------------------------------
 def build_paper_loop(
@@ -760,6 +1074,7 @@ def build_paper_loop(
     model_version: str = "latest",
     high_risk_news_fn: Optional[Callable[[], bool]] = None,
     cli_strategy: Optional[str] = None,
+    instrument: Optional[str] = None,
 ) -> PaperTradingLoop:
     """Construct a :class:`PaperTradingLoop` with the project's defaults.
 
@@ -806,9 +1121,101 @@ def build_paper_loop(
         notifier=notifier,
         predictor=predictor,
         high_risk_news_fn=high_risk_news_fn,
+        instrument=instrument or settings.INSTRUMENT,
     )
     loop.trading_enabled = trading_enabled
     return loop
+
+
+def build_multi_symbol_paper_loop(
+    *,
+    settings: Settings,
+    feeds: dict[str, IncrementalFeed],
+    notifier: _NotifierLike,
+    disabled_symbols: Optional[dict[str, str]] = None,
+    model_name: Optional[str] = None,
+    model_version: str = "latest",
+    high_risk_news_fn: Optional[Callable[[], bool]] = None,
+    cli_strategy: Optional[str] = None,
+) -> MultiSymbolPaperLoop:
+    """Build one :class:`PaperTradingLoop` per (symbol, feed) pair and
+    wrap them in a :class:`MultiSymbolPaperLoop`.
+
+    The model is loaded once and shared across all per-symbol loops
+    (the predictor is stateless w.r.t. symbol — its threshold + feature
+    vector contract is the same everywhere). A per-symbol feed failure
+    is captured into ``disabled_symbols`` rather than aborting boot.
+    """
+    log = get_logger("paper.multi_symbol_builder")
+
+    predictor: Optional[Predictor] = None
+    trading_enabled = True
+    if model_name:
+        try:
+            from models.model_registry import load_model
+
+            loaded = load_model(model_name, version=model_version)
+            predictor = Predictor(loaded)
+            log.info(
+                "paper.predictor_loaded",
+                model_name=model_name,
+                model_version=loaded.metadata.get("version"),
+            )
+        except Exception as e:
+            log.error("paper.predictor_failed", error=str(e))
+            notifier.notify(
+                "system.error", kind="predictor_load_failed", error=str(e)
+            )
+            trading_enabled = False
+
+    from strategies.registry import instantiate_enabled
+
+    loops: dict[str, PaperTradingLoop] = {}
+    for sym, feed in feeds.items():
+        sym = sym.upper()
+        try:
+            strategies = instantiate_enabled(
+                settings, instrument=sym, cli_strategy=cli_strategy
+            )
+            loop = PaperTradingLoop(
+                settings=settings,
+                feed=feed,
+                strategies=strategies,
+                notifier=notifier,
+                predictor=predictor,
+                high_risk_news_fn=high_risk_news_fn,
+                instrument=sym,
+            )
+            loop.trading_enabled = trading_enabled
+            loops[sym] = loop
+        except Exception as e:  # noqa: BLE001 - one bad symbol must not abort boot
+            log.error(
+                "paper.symbol_loop_init_failed", symbol=sym, error=str(e)
+            )
+            notifier.notify(
+                "system.error",
+                kind="symbol_loop_init_failed",
+                symbol=sym,
+                error=str(e),
+            )
+
+    if not loops:
+        raise ValueError(
+            "build_multi_symbol_paper_loop produced zero functioning per-symbol loops; "
+            "check ENABLED_SYMBOLS, the data directory, and the model registry."
+        )
+
+    log.info(
+        "paper.multi_symbol_loaded",
+        symbols=sorted(loops),
+        disabled=list((disabled_symbols or {}).keys()),
+    )
+    return MultiSymbolPaperLoop(
+        settings=settings,
+        loops=loops,
+        notifier=notifier,
+        disabled_symbols=disabled_symbols,
+    )
 
 
 # Generate a deterministic, short id for tests that can't use uuid4 (kept here

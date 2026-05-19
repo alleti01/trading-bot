@@ -573,6 +573,64 @@ def _build_paper_feed(settings: Settings, args: argparse.Namespace, log):
     )
 
 
+def _is_multi_symbol_paper(settings: Settings) -> bool:
+    """True iff ``ENABLED_SYMBOLS`` lists more than one symbol."""
+    enabled = list(getattr(settings, "ENABLED_SYMBOLS", None) or [])
+    return len(enabled) > 1
+
+
+def _build_multi_symbol_paper_loop(
+    settings: Settings, args: argparse.Namespace, log, *, notifier, high_risk_news_fn=None
+):
+    """Build the multi-symbol orchestrator from per-symbol CSVs.
+
+    Convention: ``data/historical/<SYMBOL>/<timeframe>.csv``. Per-symbol
+    feed failures are captured into ``disabled_symbols`` so the bot
+    boots with the symbols that loaded successfully.
+    """
+    from config.instruments import SymbolUniverse
+    from data.market_data_service import build_per_symbol_feeds
+    from paper.loop import build_multi_symbol_paper_loop
+
+    universe = SymbolUniverse.from_settings(settings)
+    base_dir = settings.HISTORICAL_DATA_DIR
+    plan = build_per_symbol_feeds(
+        universe.as_list(),
+        base_dir=base_dir,
+        timeframe="1m",
+        tz=settings.TIMEZONE,
+        window_bars=settings.ROLLING_WINDOW_BARS,
+    )
+    log.info(
+        "paper.multi_symbol.feeds",
+        loaded=sorted(plan.feeds),
+        missing=plan.missing,
+        failed=list(plan.failed),
+    )
+    if not plan.feeds:
+        raise RuntimeError(
+            f"No per-symbol feeds loaded under {base_dir}. Either drop CSVs "
+            f"into data/historical/<SYMBOL>/1m.csv or run a single-symbol "
+            f"paper session by setting ENABLED_SYMBOLS to one entry."
+        )
+    disabled: dict[str, str] = {}
+    for sym in plan.missing:
+        disabled[sym] = "csv_missing"
+    for sym, err in plan.failed.items():
+        disabled[sym] = f"csv_load_failed:{err}"
+
+    return build_multi_symbol_paper_loop(
+        settings=settings,
+        feeds=plan.feeds,
+        notifier=notifier,
+        disabled_symbols=disabled,
+        model_name=args.model_name,
+        model_version=args.model_version,
+        high_risk_news_fn=high_risk_news_fn,
+        cli_strategy=args.strategy,
+    )
+
+
 def _run_smoke_paper(settings: Settings, log, *, args: argparse.Namespace) -> int:
     """Day-5 paper smoke: a few synchronous bar cycles, then exit."""
     from notifications.notification_service import NotificationService
@@ -584,15 +642,20 @@ def _run_smoke_paper(settings: Settings, log, *, args: argparse.Namespace) -> in
     from storage.tables import ClosedTrade, Notification, PaperTrade, RiskBlock
 
     notifier = NotificationService.from_settings(settings)
-    feed = _build_paper_feed(settings, args, log)
-    loop = build_paper_loop(
-        settings=settings,
-        feed=feed,
-        notifier=notifier,
-        model_name=args.model_name,
-        model_version=args.model_version,
-        cli_strategy=args.strategy,
-    )
+    if _is_multi_symbol_paper(settings):
+        loop = _build_multi_symbol_paper_loop(
+            settings, args, log, notifier=notifier
+        )
+    else:
+        feed = _build_paper_feed(settings, args, log)
+        loop = build_paper_loop(
+            settings=settings,
+            feed=feed,
+            notifier=notifier,
+            model_name=args.model_name,
+            model_version=args.model_version,
+            cli_strategy=args.strategy,
+        )
     service = SchedulerService(
         settings=settings, loop=loop, notifier=notifier, blocking=False
     )
@@ -709,16 +772,23 @@ def _run_paper_forever(settings: Settings, log, *, args: argparse.Namespace) -> 
 
     notifier = NotificationService.from_settings(settings)
     orchestrator = build_orchestrator(settings, notifier=notifier)
-    feed = _build_paper_feed(settings, args, log)
-    loop = build_paper_loop(
-        settings=settings,
-        feed=feed,
-        notifier=notifier,
-        model_name=args.model_name,
-        model_version=args.model_version,
-        high_risk_news_fn=orchestrator.high_risk_news_active,
-        cli_strategy=args.strategy,
-    )
+    if _is_multi_symbol_paper(settings):
+        loop = _build_multi_symbol_paper_loop(
+            settings, args, log,
+            notifier=notifier,
+            high_risk_news_fn=orchestrator.high_risk_news_active,
+        )
+    else:
+        feed = _build_paper_feed(settings, args, log)
+        loop = build_paper_loop(
+            settings=settings,
+            feed=feed,
+            notifier=notifier,
+            model_name=args.model_name,
+            model_version=args.model_version,
+            high_risk_news_fn=orchestrator.high_risk_news_active,
+            cli_strategy=args.strategy,
+        )
 
     # Day 8: per-trade analysis. Reuses the same LLM client built for the
     # orchestrator so we don't double-spend when agents are enabled.

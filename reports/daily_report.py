@@ -49,6 +49,44 @@ from storage.tables import (
 # Lightweight summary (Day-5 EOD Discord alert)
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
+class EndOfDaySymbolStats:
+    """Per-symbol slice of the daily summary.
+
+    Used by the EOD Discord alert + the full daily report so operators
+    running 4–6 symbols can see at a glance which one paid and which
+    one bled.
+    """
+
+    symbol: str
+    trades: int
+    wins: int
+    losses: int
+    net_pnl: float
+    profit_factor: float
+    expectancy: float
+    false_positives: int
+    risk_blocks: int
+
+    @property
+    def win_rate(self) -> float:
+        return float(self.wins) / self.trades if self.trades else 0.0
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "trades": self.trades,
+            "wins": self.wins,
+            "losses": self.losses,
+            "win_rate": round(self.win_rate, 4),
+            "net_pnl": round(self.net_pnl, 2),
+            "profit_factor": round(self.profit_factor, 4),
+            "expectancy": round(self.expectancy, 4),
+            "false_positives": self.false_positives,
+            "risk_blocks": self.risk_blocks,
+        }
+
+
+@dataclass(frozen=True)
 class EndOfDaySummary:
     """Counts that fit into a single Discord message."""
 
@@ -60,6 +98,9 @@ class EndOfDaySummary:
     gross_pnl: float
     net_pnl: float
     risk_blocks: int
+    by_symbol: tuple[EndOfDaySymbolStats, ...] = ()
+    best_symbol: Optional[str] = None
+    worst_symbol: Optional[str] = None
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -71,6 +112,9 @@ class EndOfDaySummary:
             "gross_pnl": round(self.gross_pnl, 2),
             "net_pnl": round(self.net_pnl, 2),
             "risk_blocks": self.risk_blocks,
+            "by_symbol": [s.to_payload() for s in self.by_symbol],
+            "best_symbol": self.best_symbol,
+            "worst_symbol": self.worst_symbol,
         }
 
 
@@ -268,6 +312,83 @@ def _query_analysis_section(
 # ---------------------------------------------------------------------------
 # Lightweight summary
 # ---------------------------------------------------------------------------
+def _per_symbol_stats(
+    records: list[ClosedTradeRecord],
+    risk_rows: list[RiskBlock],
+    fp_trade_ids: set[str],
+) -> list[EndOfDaySymbolStats]:
+    """Slice the trade ledger by symbol and compute the headline stats.
+
+    ``fp_trade_ids`` is the set of closed_trade ids tagged
+    ``false_positive`` by the mistake classifier (already extracted by
+    the analysis section query). We only count those trades here so
+    the per-symbol false-positive number lines up with the analysis
+    block.
+    """
+    by_symbol: dict[str, list[ClosedTradeRecord]] = {}
+    for r in records:
+        by_symbol.setdefault(r.instrument, []).append(r)
+    risk_by_symbol: dict[str, int] = {}
+    for rb in risk_rows:
+        # Risk blocks live in the DB without a denormalized symbol; we
+        # heuristically attribute via the setup_id when it was minted by
+        # a known symbol's loop. For the MVP we count totals at the
+        # whole-session level too — caller already sums them.
+        sym = getattr(rb, "instrument", None)
+        if not sym:
+            continue
+        risk_by_symbol[sym] = risk_by_symbol.get(sym, 0) + 1
+
+    stats: list[EndOfDaySymbolStats] = []
+    for sym, trades in by_symbol.items():
+        wins = sum(1 for t in trades if t.net_pnl > 0)
+        losses = sum(1 for t in trades if t.net_pnl < 0)
+        gains = float(sum(t.net_pnl for t in trades if t.net_pnl > 0))
+        loss_sum = float(-sum(t.net_pnl for t in trades if t.net_pnl < 0))
+        pf = (gains / loss_sum) if loss_sum > 0 else (float("inf") if gains > 0 else 0.0)
+        expectancy = (
+            float(sum(t.net_pnl for t in trades) / len(trades)) if trades else 0.0
+        )
+        fp = sum(1 for t in trades if t.setup_id in fp_trade_ids)
+        stats.append(
+            EndOfDaySymbolStats(
+                symbol=sym,
+                trades=len(trades),
+                wins=wins,
+                losses=losses,
+                net_pnl=float(sum(t.net_pnl for t in trades)),
+                profit_factor=float(pf) if pf != float("inf") else 0.0,
+                expectancy=expectancy,
+                false_positives=fp,
+                risk_blocks=int(risk_by_symbol.get(sym, 0)),
+            )
+        )
+    # Sort by net PnL descending so reports show the winners first.
+    stats.sort(key=lambda s: -s.net_pnl)
+    return stats
+
+
+def _false_positive_trade_ids(settings: Settings, *, now: datetime) -> set[str]:
+    start_utc, end_utc = _session_window_utc(now, settings)
+    with session_scope() as session:
+        rows = session.execute(
+            select(TradeMistakeTag).where(
+                TradeMistakeTag.tag == "false_positive",
+            )
+        ).scalars().all()
+        # Intersect with this session's analyses to keep things bounded.
+        analyses = list(
+            session.execute(
+                select(TradeAnalysis.closed_trade_id).where(
+                    TradeAnalysis.entry_ts >= start_utc,
+                    TradeAnalysis.entry_ts < end_utc,
+                )
+            ).scalars().all()
+        )
+    valid = set(analyses)
+    return {r.closed_trade_id for r in rows if r.closed_trade_id in valid}
+
+
 def generate_end_of_day_summary(
     settings: Settings, *, now: datetime | None = None
 ) -> EndOfDaySummary:
@@ -282,6 +403,12 @@ def generate_end_of_day_summary(
     breakevens = trades - wins - losses
     net_pnl = float(sum(r.net_pnl for r in records))
     gross_pnl = float(sum(r.gross_pnl for r in records))
+
+    fp_ids = _false_positive_trade_ids(settings, now=now)
+    by_symbol = _per_symbol_stats(records, risk_rows, fp_ids)
+    best = by_symbol[0].symbol if by_symbol else None
+    worst = by_symbol[-1].symbol if by_symbol else None
+
     summary = EndOfDaySummary(
         session_date=session_date(now, settings).isoformat(),
         trades=trades,
@@ -291,6 +418,9 @@ def generate_end_of_day_summary(
         gross_pnl=gross_pnl,
         net_pnl=net_pnl,
         risk_blocks=len(risk_rows),
+        by_symbol=tuple(by_symbol),
+        best_symbol=best,
+        worst_symbol=worst,
     )
     log.info("eod.summary", **summary.to_payload())
     return summary
@@ -336,11 +466,16 @@ def build_daily_report_payload(
     sd = session_date(now, settings)
 
     analysis_section = _query_analysis_section(settings, now=now)
+    fp_ids = _false_positive_trade_ids(settings, now=now)
+    by_symbol = _per_symbol_stats(records, risk_rows, fp_ids)
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "session_date": sd.isoformat(),
         "instrument": settings.INSTRUMENT,
+        "enabled_symbols": list(getattr(settings, "ENABLED_SYMBOLS", [])) or [
+            settings.INSTRUMENT
+        ],
         "market_type": spec.market_type,
         "timezone": settings.TIMEZONE,
         "mode": settings.MODE,
@@ -348,6 +483,9 @@ def build_daily_report_payload(
         "daily_pnl": daily_pnl_table(records),
         "trades": [_trade_row(r) for r in records],
         "analysis": analysis_section,
+        "by_symbol": [s.to_payload() for s in by_symbol],
+        "best_symbol": by_symbol[0].symbol if by_symbol else None,
+        "worst_symbol": by_symbol[-1].symbol if by_symbol else None,
         "risk_blocks": [
             {
                 "ts": rb.ts.isoformat() if rb.ts else None,
@@ -441,6 +579,34 @@ def render_daily_markdown(payload: dict[str, Any]) -> str:
             ]
         )
     lines.append("")
+
+    # ----- Per-symbol breakdown -----
+    by_symbol = payload.get("by_symbol") or []
+    if by_symbol:
+        lines.append("## Performance by symbol")
+        lines.append("")
+        lines.append(
+            "| Symbol | Trades | Wins | Win rate | Net PnL | Profit factor |"
+            " Expectancy | False positives | Risk blocks |"
+        )
+        lines.append(
+            "|--------|-------:|-----:|---------:|--------:|--------------:|"
+            "-----------:|----------------:|------------:|"
+        )
+        for s in by_symbol:
+            lines.append(
+                f"| {s['symbol']} | {s['trades']} | {s['wins']} | "
+                f"{s['win_rate']:.2%} | ${s['net_pnl']:.2f} | "
+                f"{s['profit_factor']:.2f} | ${s['expectancy']:.2f} | "
+                f"{s['false_positives']} | {s['risk_blocks']} |"
+            )
+        if payload.get("best_symbol") and payload.get("worst_symbol"):
+            lines.append("")
+            lines.append(
+                f"- Best symbol: **{payload['best_symbol']}** · "
+                f"Worst symbol: **{payload['worst_symbol']}**"
+            )
+        lines.append("")
 
     # ----- Compliance -----
     lines.append("## Compliance")

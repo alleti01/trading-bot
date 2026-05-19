@@ -43,6 +43,22 @@ class Settings(BaseSettings):
     MARKET_TYPE: MarketType = "futures"
     TIMEZONE: str = "America/New_York"
 
+    # ---- Multi-symbol universe ----------------------------------------
+    # Comma-separated symbols paper mode and backtest will scan. Single
+    # entry == single-symbol behavior (back-compat default).
+    # ``NoDecode`` keeps pydantic-settings from JSON-parsing the env var
+    # before our validator can split on commas.
+    ENABLED_SYMBOLS: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["MES"]
+    )
+    # Optional override; defaults to INSTRUMENT in code. Used by
+    # reports + the model registry as the "headline" symbol.
+    PRIMARY_SYMBOL: Optional[str] = None
+    # Caps the orchestrator enforces across all per-symbol loops:
+    MAX_ACTIVE_SYMBOLS: int = Field(default=1, ge=1)
+    MAX_TRADES_PER_SYMBOL_PER_DAY: int = Field(default=4, ge=1)
+    MAX_TOTAL_TRADES_PER_DAY: int = Field(default=8, ge=1)
+
     # ---- LIVE lockout --------------------------------------------------
     LIVE_ADAPTER_CONFIRMED: bool = False
 
@@ -168,6 +184,15 @@ class Settings(BaseSettings):
         if not v:
             v = ["vwap_ema_pullback"]
         return v
+
+    @field_validator("ENABLED_SYMBOLS", mode="before")
+    @classmethod
+    def _split_enabled_symbols(cls, v):
+        if isinstance(v, str):
+            v = [s.strip() for s in v.split(",") if s.strip()]
+        if not v:
+            return v
+        return [str(s).strip().upper() for s in v if str(s).strip()]
 
     @field_validator("CONFIDENCE_THRESHOLD")
     @classmethod

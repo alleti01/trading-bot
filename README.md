@@ -198,6 +198,145 @@ python -m app.main --mode PAPER \
 `Ctrl-C`. End-of-day automatically writes the daily report + trade
 journal and pings Discord with the file paths.
 
+## Multi-symbol mode
+
+The bot supports a configurable symbol universe. Single-symbol bots
+keep working unchanged (default: `ENABLED_SYMBOLS=MES`). Multi-symbol
+mode kicks in automatically when `ENABLED_SYMBOLS` lists more than one
+symbol.
+
+### Configure the universe
+
+```ini
+# .env
+ENABLED_SYMBOLS=MES,MNQ,MGC,MCL,MYM,M2K
+PRIMARY_SYMBOL=MES                # optional; defaults to INSTRUMENT
+MAX_ACTIVE_SYMBOLS=2              # max simultaneous open positions across symbols
+MAX_TRADES_PER_SYMBOL_PER_DAY=4   # per-(symbol, session_date) cap
+MAX_TOTAL_TRADES_PER_DAY=8        # global cap across all symbols
+MARKET_TYPE=futures               # all symbols must share the same market type
+```
+
+Built-in registered symbols: `MES`, `MNQ`, `MGC`, `MCL`, `MYM`, `M2K`,
+`BTC`, `ETH`. Add a new instrument by registering an
+:class:`InstrumentSpec` in `config/instruments.py`.
+
+`SymbolUniverse.from_settings(settings)` parses + validates the env:
+
+- Duplicates are rejected (`SymbolUniverseError`).
+- Unknown symbols are rejected with the supported set listed in the
+  message.
+- Mixing `futures` and `crypto` in one universe is rejected.
+- Empty `ENABLED_SYMBOLS` falls back to `[INSTRUMENT]`.
+
+### Per-symbol CSV layout
+
+Drop one CSV per symbol under `data/historical/<SYMBOL>/<timeframe>.csv`:
+
+```
+data/historical/
+├── MES/1m.csv
+├── MNQ/1m.csv
+├── MGC/1m.csv
+└── ...
+```
+
+Each CSV must have the standard columns: `timestamp, open, high, low,
+close, volume`. A missing or corrupt file disables only that symbol —
+the orchestrator boots the rest and surfaces the disabled set in the
+log line `paper.multi_symbol_loaded`.
+
+### Multi-symbol paper mode
+
+```bash
+ENABLED_SYMBOLS="MES,MNQ,MGC,MCL,MYM,M2K" \
+  python -m app.main --mode PAPER \
+  --model-name vwap_ema_pullback_lr
+```
+
+What the orchestrator does each tick:
+
+1. Polls every per-symbol incremental feed.
+2. Runs each symbol's :class:`PaperTradingLoop` independently — its
+   own portfolio, fills model, kill switch, risk engine, and
+   strategy registry instance.
+3. Before any submit, an `entry_gate` callback checks the caps:
+   - `MAX_TRADES_PER_SYMBOL_PER_DAY` (and the existing
+     `MAX_TRADES_PER_DAY` — whichever is lower wins);
+   - `MAX_TOTAL_TRADES_PER_DAY` summed across all symbols;
+   - `MAX_ACTIVE_SYMBOLS` against the count of per-symbol loops
+     currently holding an open position.
+4. Cap-blocked setups are recorded as `risk_blocks` rows with a
+   structured rule (`per_symbol_day_cap`, `total_day_cap`,
+   `max_active_symbols`) so the audit trail mirrors deterministic
+   risk-engine blocks.
+5. Per-symbol failures are isolated. A feed crash on `MNQ` cannot
+   stop `MES` from running.
+
+The strategy registry's existing conflict resolver still enforces "no
+long+short on the same symbol" within a single tick (see "Strategies"
+below). Across symbols, the `MAX_ACTIVE_SYMBOLS` cap is the safety
+guarantee.
+
+### Multi-symbol backtest
+
+```python
+from backtesting.engine import run_multi_symbol_backtest
+
+result = run_multi_symbol_backtest(
+    settings=settings,
+    ohlcv_by_symbol={"MES": mes_df, "MNQ": mnq_df, "MGC": mgc_df},
+    setups_by_symbol={"MES": mes_setups, "MNQ": mnq_setups, "MGC": mgc_setups},
+)
+print(result.to_dict()["per_symbol"])
+print("best:", result.best_symbol(), "worst:", result.worst_symbol())
+```
+
+Each symbol runs through its own :class:`BacktestEngine` (independent
+portfolio, fills, risk state). The aggregate equity curve is the
+exit-time-sorted union of per-symbol trades; aggregate metrics are
+computed off the merged trade list.
+
+### Daily report — per-symbol breakdown
+
+The daily report's payload now includes a `by_symbol` block with
+trades, wins, win rate, net PnL, profit factor, expectancy, false
+positives, and risk blocks per symbol. The Markdown render adds a
+"Performance by symbol" table plus best/worst-symbol callouts. The
+Discord EOD message (`eod.summary`) carries the same `by_symbol`
+list so operators see which symbol paid the bills today.
+
+### TradingView webhook (optional input)
+
+Webhooks are an *additional* signal source — the bot's primary
+scanner is the per-symbol paper loop, which polls feeds on the
+configured cadence regardless of whether any webhook is wired.
+
+```python
+from webhook import validate_webhook_signal
+from config.instruments import SymbolUniverse
+
+universe = SymbolUniverse.from_settings(settings)
+signal = validate_webhook_signal(
+    {"symbol": "MES", "direction": "long", "price": 4500.25, "stop": 4495.0, "target": 4510.0},
+    universe=universe,
+    expected_secret="hunter2",  # optional shared secret
+)
+```
+
+Behavior:
+
+- **Symbols not in `ENABLED_SYMBOLS` are rejected** with
+  `InvalidWebhookSignal`. The bot never trades a symbol operations
+  did not whitelist, even if a third-party alert says to.
+- Missing required fields, malformed prices, unknown directions, or
+  a bad shared secret all produce `InvalidWebhookSignal` (HTTP layers
+  should map this to `400 Bad Request`).
+- `direction` accepts both `long`/`short` and `buy`/`sell`.
+- An accepted signal returns a typed :class:`WebhookSignal` ready
+  to be turned into a setup by the caller. Live broker execution is
+  out of scope; the MVP only paper-trades.
+
 ## Strategies
 
 Strategies are plug-ins. The in-tree set lives under `strategies/` and
