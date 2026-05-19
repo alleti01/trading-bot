@@ -70,7 +70,16 @@ class _DummyLoop:
 
 def test_scheduler_eod_writes_markdown_and_notifies_paths(tmp_path: Path) -> None:
     s = _settings(tmp_path)
-    base = datetime(2026, 5, 18, 14, 0, tzinfo=timezone.utc)
+    # The EOD job filters by today's session date in the configured tz.
+    # Hardcoding a fixed datetime made this test silently break once the
+    # wall-clock day rolled past it; anchor to ``today()`` instead.
+    from zoneinfo import ZoneInfo
+
+    today_local = datetime.now(ZoneInfo(s.TIMEZONE)).date()
+    base = datetime(
+        today_local.year, today_local.month, today_local.day, 14, 0,
+        tzinfo=ZoneInfo(s.TIMEZONE),
+    ).astimezone(timezone.utc)
     _seed_one_trade(base)
 
     notifier = _CapturingNotifier()

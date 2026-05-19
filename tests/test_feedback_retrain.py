@@ -90,6 +90,7 @@ def _seed_closed_trades_with_features(
     strategy: str = "vwap_ema_pullback",
     base_ts: datetime | None = None,
     seed: int = 0,
+    tag_every_loss: bool = False,
 ) -> list[str]:
     """Seed ``n`` closed trades each backed by a Setup + FeatureSnapshot.
 
@@ -174,7 +175,8 @@ def _seed_closed_trades_with_features(
             )
             session.add(ta)
             session.flush()
-            if not win and i % 3 == 0:
+            should_tag = (not win) and (tag_every_loss or i % 3 == 0)
+            if should_tag:
                 session.add(
                     TradeMistakeTag(
                         trade_analysis_id=ta.id,
@@ -264,7 +266,9 @@ def test_cli_retrain_exits_nonzero_when_too_few_rows(tmp_path: Path) -> None:
     from app.logging_config import get_logger
     from app.main import _run_retrain_from_feedback, parse_args
 
-    args = parse_args(["--retrain-from-feedback"])
+    args = parse_args(
+        ["--retrain-from-feedback", "--model-name", "vwap_ema_pullback_lr"]
+    )
     log = get_logger("test")
     rc = _run_retrain_from_feedback(s, log, args=args)
 
@@ -317,7 +321,9 @@ def test_cli_retrain_saves_candidate_model(tmp_path: Path) -> None:
     from app.logging_config import get_logger
     from app.main import _run_retrain_from_feedback, parse_args
 
-    args = parse_args(["--retrain-from-feedback"])
+    args = parse_args(
+        ["--retrain-from-feedback", "--model-name", "vwap_ema_pullback_lr"]
+    )
     log = get_logger("test")
     rc = _run_retrain_from_feedback(s, log, args=args)
     assert rc == 0
@@ -333,9 +339,10 @@ def test_cli_retrain_saves_candidate_model(tmp_path: Path) -> None:
 
     metadata = json.loads(metadata_path.read_text())
     assert metadata["candidate"] is True
-    assert metadata["source"] == "feedback_dataset"
+    assert metadata["source"] == "feedback"
     assert metadata["incumbent_name"] == "vwap_ema_pullback_lr"
     assert metadata["label_strategy"] == "pnl_positive"
+    assert metadata["model_kind"] == "logreg"
     assert "test_metrics" in metadata
     for key in (
         "expectancy_per_trade",
@@ -357,6 +364,8 @@ def test_candidate_model_name_override(tmp_path: Path) -> None:
     args = parse_args(
         [
             "--retrain-from-feedback",
+            "--model-name",
+            "vwap_ema_pullback_lr",
             "--candidate-model-name",
             "my_custom_candidate",
         ]
@@ -417,7 +426,9 @@ def test_retrain_does_not_promote_or_modify_incumbent(tmp_path: Path) -> None:
     from app.logging_config import get_logger
     from app.main import _run_retrain_from_feedback, parse_args
 
-    args = parse_args(["--retrain-from-feedback"])
+    args = parse_args(
+        ["--retrain-from-feedback", "--model-name", "vwap_ema_pullback_lr"]
+    )
     log = get_logger("test")
     rc = _run_retrain_from_feedback(s, log, args=args)
     assert rc == 0
@@ -447,7 +458,9 @@ def test_retrain_without_incumbent_still_saves_candidate(tmp_path: Path) -> None
     from app.logging_config import get_logger
     from app.main import _run_retrain_from_feedback, parse_args
 
-    args = parse_args(["--retrain-from-feedback"])
+    args = parse_args(
+        ["--retrain-from-feedback", "--model-name", "vwap_ema_pullback_lr"]
+    )
     log = get_logger("test")
     rc = _run_retrain_from_feedback(s, log, args=args)
     assert rc == 0
@@ -526,3 +539,131 @@ def test_excluded_no_features_counted() -> None:
             bare.append(r)
     result = train_candidate_from_feedback(bare, min_rows=100)
     assert result.excluded_no_features == 12
+
+
+# ---------------------------------------------------------------------------
+# 8. New CLI flag spec parity (--min-feedback-rows / --use-mistake-tags-as-label / --feedback-model-kind)
+# ---------------------------------------------------------------------------
+def test_cli_min_feedback_rows_flag_overrides_settings(tmp_path: Path) -> None:
+    """``--min-feedback-rows`` is the canonical flag and must override
+    the env-derived ``FEEDBACK_MIN_ROWS``."""
+    s = _settings(tmp_path, FEEDBACK_MIN_ROWS="500")
+    _seed_closed_trades_with_features(140, seed=20)
+
+    from app.logging_config import get_logger
+    from app.main import _run_retrain_from_feedback, parse_args
+
+    args = parse_args(
+        [
+            "--retrain-from-feedback",
+            "--model-name",
+            "vwap_ema_pullback_lr",
+            "--min-feedback-rows",
+            "100",
+        ]
+    )
+    log = get_logger("test")
+    rc = _run_retrain_from_feedback(s, log, args=args)
+    assert rc == 0
+    assert (Path(s.MODELS_DIR) / "vwap_ema_pullback_lr_candidate").is_dir()
+
+
+def test_cli_legacy_feedback_min_rows_alias_still_works(tmp_path: Path) -> None:
+    """The old ``--feedback-min-rows`` flag is kept as an alias so prior
+    operator scripts and earlier README revisions don't break."""
+    s = _settings(tmp_path, FEEDBACK_MIN_ROWS="500")
+    _seed_closed_trades_with_features(140, seed=21)
+
+    from app.logging_config import get_logger
+    from app.main import _run_retrain_from_feedback, parse_args
+
+    args = parse_args(
+        [
+            "--retrain-from-feedback",
+            "--model-name",
+            "vwap_ema_pullback_lr",
+            "--feedback-min-rows",
+            "100",
+        ]
+    )
+    log = get_logger("test")
+    rc = _run_retrain_from_feedback(s, log, args=args)
+    assert rc == 0
+
+
+def test_cli_use_mistake_tags_as_label_flag(tmp_path: Path) -> None:
+    """``--use-mistake-tags-as-label`` swaps the candidate's label
+    strategy and is reflected in saved metadata.
+
+    The seeding path tags *every* loss so that under the inverse-mistake
+    label mapping the dataset still has both classes after the
+    chronological 70/15/15 split (otherwise calibration on a 21-row
+    val slice can degenerate)."""
+    s = _settings(tmp_path, FEEDBACK_MIN_ROWS="100")
+    _seed_closed_trades_with_features(
+        140, win_rate=0.5, seed=22, tag_every_loss=True
+    )
+
+    from app.logging_config import get_logger
+    from app.main import _run_retrain_from_feedback, parse_args
+
+    args = parse_args(
+        [
+            "--retrain-from-feedback",
+            "--model-name",
+            "vwap_ema_pullback_lr",
+            "--use-mistake-tags-as-label",
+        ]
+    )
+    log = get_logger("test")
+    rc = _run_retrain_from_feedback(s, log, args=args)
+    assert rc == 0
+
+    version_dir = next(
+        (Path(s.MODELS_DIR) / "vwap_ema_pullback_lr_candidate").iterdir()
+    )
+    metadata = json.loads((version_dir / "metadata.json").read_text())
+    assert metadata["label_strategy"] == "mistake_tag_inverse"
+
+
+def test_cli_feedback_model_kind_logreg_default(tmp_path: Path) -> None:
+    """The default model_kind is logreg and ends up in candidate metadata."""
+    s = _settings(tmp_path, FEEDBACK_MIN_ROWS="100")
+    _seed_closed_trades_with_features(140, seed=23)
+
+    from app.logging_config import get_logger
+    from app.main import _run_retrain_from_feedback, parse_args
+
+    args = parse_args(
+        [
+            "--retrain-from-feedback",
+            "--model-name",
+            "vwap_ema_pullback_lr",
+            "--feedback-model-kind",
+            "logreg",
+        ]
+    )
+    log = get_logger("test")
+    rc = _run_retrain_from_feedback(s, log, args=args)
+    assert rc == 0
+    version_dir = next(
+        (Path(s.MODELS_DIR) / "vwap_ema_pullback_lr_candidate").iterdir()
+    )
+    metadata = json.loads((version_dir / "metadata.json").read_text())
+    assert metadata["model_kind"] == "logreg"
+
+
+def test_cli_retrain_requires_model_name(tmp_path: Path) -> None:
+    """Without --model-name the runner refuses and exits 4."""
+    s = _settings(tmp_path, FEEDBACK_MIN_ROWS="100")
+    _seed_closed_trades_with_features(140, seed=24)
+
+    from app.logging_config import get_logger
+    from app.main import _run_retrain_from_feedback, parse_args
+
+    args = parse_args(["--retrain-from-feedback"])
+    log = get_logger("test")
+    rc = _run_retrain_from_feedback(s, log, args=args)
+    assert rc == 4
+    # No candidate should have been created.
+    assert not (Path(s.MODELS_DIR) / "vwap_ema_pullback_lr_candidate").exists()

@@ -139,7 +139,9 @@ What the runner does:
    drops bad timestamps and OHLC violations, dedupes, sorts).
 2. Builds canonical features using the same feature builder the
    strategy and predictor use.
-3. Detects setups with `VWAPEMAPullback`.
+3. Detects setups with the strategy resolved through the registry
+   (`--strategy`, default `vwap_ema_pullback`; pass
+   `--strategy opening_range_breakout` to train the ORB plug-in).
 4. Labels each setup with `label_setups` (TP / SL / time-out, with
    conservative same-bar SL-first ambiguity resolution).
 5. Splits **strictly chronologically** by setup timestamp (no
@@ -195,6 +197,77 @@ python -m app.main --mode PAPER \
 `bar_close`, `force_flat`, `end_of_day`, and `heartbeat` jobs until you
 `Ctrl-C`. End-of-day automatically writes the daily report + trade
 journal and pings Discord with the file paths.
+
+## Strategies
+
+Strategies are plug-ins. The in-tree set lives under `strategies/` and
+registers itself with `strategies.registry.STRATEGY_REGISTRY` at import
+time. Built-ins:
+
+- `vwap_ema_pullback` — VWAP/EMA trend pullback (default).
+- `opening_range_breakout` — fresh breakout above/below the session's
+  opening range.
+
+`MODE=TRAIN` and `MODE=BACKTEST` run a single named strategy via
+`--strategy NAME`. Paper mode reads `ENABLED_STRATEGIES` (comma-
+separated env var, default `vwap_ema_pullback`) to decide which
+strategies to run. Passing `--strategy NAME` to paper mode overrides
+the env and runs only that one strategy.
+
+```bash
+# Train ORB instead of the default
+python -m app.main --mode TRAIN \
+  --train-csv data/historical/MES/1m.csv \
+  --model-name orb_lr \
+  --strategy opening_range_breakout
+
+# Run multiple strategies in paper mode
+ENABLED_STRATEGIES="vwap_ema_pullback,opening_range_breakout" \
+  python -m app.main --mode PAPER \
+  --paper-csv data/historical/MES/1m.csv \
+  --model-name vwap_ema_pullback_lr
+```
+
+### Multi-strategy conflict resolution
+
+When two enabled strategies fire on the same instrument and the same
+bar, the loop never takes both opposing positions. The resolver lives
+in `strategies/registry.py` and applies these rules in order:
+
+1. Same-direction signals on the same symbol all survive (e.g. two
+   strategies both going long).
+2. If long *and* short are present on the same symbol:
+   - both sides scored + approved → keep the higher confidence;
+   - either side missing a model confidence → drop both (we refuse to
+     guess);
+   - neither side approved → drop both.
+3. Every conflict is logged (`strategy.conflict`) and emits a
+   notification with the winner + dropped setup ids for the audit
+   trail.
+
+### Adding a new strategy
+
+```python
+# strategies/my_strategy.py
+from strategies.base import Strategy, Setup, StrategyParams
+
+class MyStrategy(Strategy):
+    name = "my_strategy"
+    @classmethod
+    def _default_params(cls): return StrategyParams()
+    def detect_setups(self, features_df): ...
+```
+
+Then register it in `strategies/registry.py`:
+
+```python
+from strategies.my_strategy import MyStrategy
+STRATEGY_REGISTRY.register(MyStrategy)
+```
+
+`tests/test_strategy_registry.py` enforces that every registered
+strategy is reachable via `--strategy` and via `ENABLED_STRATEGIES`,
+plus that the conflict resolver rules above hold.
 
 ## Reports
 
@@ -294,8 +367,11 @@ SchedulerService._safe_end_of_day
 Pipeline (operator-driven retraining + promotion):
 
 ```
-python -m app.main --retrain-from-feedback   # build dataset + train candidate + comparison report
-python -m app.main --promote-model VERSION   # only if PromotionDecision says so
+python -m app.main --retrain-from-feedback \
+  --model-name vwap_ema_pullback_lr \
+  --min-feedback-rows 100             # build dataset + train candidate + comparison report
+python -m app.main --promote-model VERSION \
+  --model-name vwap_ema_pullback_lr_candidate   # only if PromotionDecision says so
 ```
 
 See [Feedback retraining workflow](#feedback-retraining-workflow-paper--candidate--review--promote)
@@ -373,50 +449,73 @@ training only runs after it.
 ### 3. Retrain a candidate model
 
 ```bash
-python -m app.main --retrain-from-feedback
+python -m app.main \
+  --retrain-from-feedback \
+  --model-name vwap_ema_pullback_lr \
+  --min-feedback-rows 100
 ```
+
+`--model-name` is **required** — it's the incumbent's registry name.
+The candidate is saved as `<model-name>_candidate` unless you override
+it with `--candidate-model-name`.
 
 This:
 
 1. Builds the feedback dataset from `closed_trades` ⨯
-   `feature_snapshots` ⨯ `model_predictions` ⨯ `trade_mistake_tags`.
-2. Refuses to train if there are fewer than `FEEDBACK_MIN_ROWS` rows
-   (or fewer rows with full feature vectors). Exits with code `4`.
+   `feature_snapshots` ⨯ `model_predictions` ⨯ `trade_mistake_tags`,
+   then writes it to `data/reports/feedback/feedback_dataset.{csv,json}`.
+2. Refuses to train if there are fewer than `--min-feedback-rows`
+   (default **100**, or whatever `FEEDBACK_MIN_ROWS` env var sets) rows
+   with full feature vectors. Exits with code `4`.
 3. Splits **strictly chronologically** by entry timestamp
    (70% train / 15% val / 15% test). No shuffling, ever.
-4. Trains a logistic-regression baseline; calibrates on val.
-5. Optionally trains LightGBM if installed (metrics-only — the saved
-   artifact is always the calibrated logreg).
+4. Trains the kind selected by `--feedback-model-kind` (default
+   `logreg`); calibrates on val.
+5. If LightGBM is installed it also trains the *other* kind for
+   metrics-only comparison — never saved as the candidate artifact.
 6. Evaluates on the holdout test split: accuracy, precision, recall,
    false-positive rate, ROC-AUC, **expectancy per trade**,
    **profit factor**, **drawdown proxy**, and **calibration MAE** —
    all on the trades the candidate model would have approved.
 7. Saves the candidate to
    `data/models/<model-name>_candidate/<version>/` with
-   `metadata.json` carrying `candidate=true`, the realized trade
-   metrics, the mistake-tag counts, and the chronological split
-   ranges.
+   `metadata.json` carrying `candidate=true`, `source=feedback`,
+   `model_kind`, realized trade metrics, mistake-tag counts, and the
+   chronological split ranges.
 8. Writes a Markdown promotion report under
    `data/reports/feedback/promotion_*.md`.
 
 **The candidate is never automatically promoted.** Mistake tags are
 stored in metadata as a diagnostic signal; they are *not* used as
-labels unless you opt in with `--feedback-use-mistake-tags`.
+labels unless you opt in with `--use-mistake-tags-as-label`.
 
 Useful overrides:
 
 ```bash
 # Override min rows (e.g. for an early-validation pilot)
-python -m app.main --retrain-from-feedback --feedback-min-rows 60
+python -m app.main --retrain-from-feedback \
+  --model-name vwap_ema_pullback_lr \
+  --min-feedback-rows 60
 
-# Train against a non-default incumbent and pick a custom candidate name
+# Pick a custom candidate name
 python -m app.main --retrain-from-feedback \
   --model-name vwap_ema_pullback_lr \
   --candidate-model-name vwap_ema_pullback_lr_2026_q2
 
+# Train a LightGBM candidate (requires `pip install lightgbm`)
+python -m app.main --retrain-from-feedback \
+  --model-name vwap_ema_pullback_lr \
+  --feedback-model-kind lightgbm
+
 # Treat mistake-tagged trades as negative labels (advanced)
-python -m app.main --retrain-from-feedback --feedback-use-mistake-tags
+python -m app.main --retrain-from-feedback \
+  --model-name vwap_ema_pullback_lr \
+  --use-mistake-tags-as-label
 ```
+
+The previous flag names `--feedback-min-rows` and
+`--feedback-use-mistake-tags` are kept as **aliases** so existing
+operator scripts and earlier README revisions still work.
 
 ### 4. Review the candidate
 

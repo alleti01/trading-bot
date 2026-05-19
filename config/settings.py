@@ -15,11 +15,11 @@ from __future__ import annotations
 
 from datetime import time
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 from zoneinfo import ZoneInfo
 
 from pydantic import Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 Mode = Literal["BACKTEST", "TRAIN", "PAPER", "LIVE"]
 MarketType = Literal["futures", "crypto"]
@@ -62,6 +62,18 @@ class Settings(BaseSettings):
     COOLDOWN_AFTER_LARGE_WIN_MINUTES: int = Field(default=15, ge=0)
     LARGE_WIN_THRESHOLD: float = Field(default=200.0, ge=0.0)
     MAX_HOLD_BARS: int = Field(default=20, ge=1)
+
+    # ---- Strategies -----------------------------------------------------
+    # Comma-separated list of strategy names that paper mode runs. Single
+    # strategy is the default; adding more enables multi-strategy paper
+    # mode through the strategies.registry conflict resolver.
+    #
+    # ``NoDecode`` tells pydantic-settings *not* to JSON-parse this env
+    # var before ``_split_enabled_strategies`` sees it, so operators can
+    # write ``ENABLED_STRATEGIES=a,b`` instead of ``["a","b"]``.
+    ENABLED_STRATEGIES: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["vwap_ema_pullback"]
+    )
 
     # ---- Model ---------------------------------------------------------
     CONFIDENCE_THRESHOLD: float = 0.60
@@ -144,6 +156,17 @@ class Settings(BaseSettings):
             ZoneInfo(v)
         except Exception as e:
             raise ValueError(f"Invalid timezone '{v}'") from e
+        return v
+
+    @field_validator("ENABLED_STRATEGIES", mode="before")
+    @classmethod
+    def _split_enabled_strategies(cls, v):
+        # Accept both JSON-style ``["a","b"]`` (pydantic-settings default)
+        # and the operator-friendly comma-separated env form ``"a,b"``.
+        if isinstance(v, str):
+            v = [s.strip() for s in v.split(",") if s.strip()]
+        if not v:
+            v = ["vwap_ema_pullback"]
         return v
 
     @field_validator("CONFIDENCE_THRESHOLD")

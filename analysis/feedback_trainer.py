@@ -32,11 +32,15 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 
+from typing import Literal
+
 from analysis.types import FeedbackDatasetRow
 from app.logging_config import get_logger
 from features.feature_builder import FEATURE_COLUMNS
 from models.trainer import TrainResult, has_lightgbm, train
 from validation.time_split import chronological_split
+
+CandidateModelKind = Literal["logreg", "lightgbm"]
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +249,7 @@ def train_candidate_from_feedback(
     use_mistake_tags_as_label: bool = False,
     train_frac: float = 0.70,
     val_frac: float = 0.15,
+    model_kind: CandidateModelKind = "logreg",
 ) -> CandidateTrainResult:
     """Run the candidate retrain pipeline end-to-end.
 
@@ -253,14 +258,32 @@ def train_candidate_from_feedback(
     1. Reject rows with no feature snapshot (cannot retrain without features).
     2. Enforce ``min_rows`` (raises :class:`InsufficientFeedbackError`).
     3. Sort by ``entry_ts`` and chronologically split (train / val / test).
-    4. Train a logistic-regression baseline; calibrate on val.
-    5. If LightGBM is installed, train a boosted model — *metrics only*,
-       not saved as the primary artifact.
+    4. Train the model selected by ``model_kind`` (default ``logreg``);
+       calibrate on val. This is the artifact that gets saved.
+    5. Train the *other* kind (when available) for metrics-only
+       comparison — never saved as the primary artifact.
     6. Compute realized trade metrics (expectancy / profit factor /
        drawdown proxy / FPR / calibration) on the **test** split using the
-       saved logreg model's gating threshold.
+       saved model's gating threshold.
+
+    Notes on ``model_kind``:
+
+    - ``"logreg"`` (default) is the safe baseline; it always works.
+    - ``"lightgbm"`` requires the optional ``lightgbm`` package. If it
+      is not installed we raise :class:`InsufficientFeedbackError`
+      rather than silently downgrade — the caller asked for a specific
+      model.
     """
     log = get_logger("analysis.feedback_trainer")
+
+    if model_kind not in ("logreg", "lightgbm"):
+        raise ValueError(f"Unknown model_kind: {model_kind!r}")
+    if model_kind == "lightgbm" and not has_lightgbm():
+        raise InsufficientFeedbackError(
+            "model_kind='lightgbm' requested but the lightgbm package is "
+            "not installed. Install it (pip install lightgbm) or use "
+            "model_kind='logreg'."
+        )
 
     if train_frac <= 0 or val_frac < 0 or train_frac + val_frac >= 1.0:
         raise ValueError(
@@ -324,33 +347,40 @@ def train_candidate_from_feedback(
         test_end=str(X_test.index[-1]),
     )
 
-    # 1. Logistic regression baseline (primary, saved).
-    lr_result = train(
+    # 1. Primary (saved) model — kind selected by the operator.
+    primary_result = train(
         X_train,
         y_train,
         X_val,
         y_val,
-        model_kind="logreg",
+        model_kind=model_kind,
         feature_names=list(FEATURE_COLUMNS),
     )
 
-    # 2. Optional LightGBM (metrics-only).
+    # 2. Secondary (metrics-only) model: train the *other* kind when
+    #    available so the operator can compare. Never saved.
     boosted_result: Optional[TrainResult] = None
-    if has_lightgbm():
+    secondary_kind = "lightgbm" if model_kind == "logreg" else "logreg"
+    secondary_available = secondary_kind != "lightgbm" or has_lightgbm()
+    if secondary_available:
         try:
             boosted_result = train(
                 X_train,
                 y_train,
                 X_val,
                 y_val,
-                model_kind="lightgbm",
+                model_kind=secondary_kind,
                 feature_names=list(FEATURE_COLUMNS),
             )
-        except Exception as e:  # noqa: BLE001 - boosted is best-effort
-            log.warning("feedback_trainer.lightgbm_failed", error=str(e))
+        except Exception as e:  # noqa: BLE001 - secondary is best-effort
+            log.warning(
+                "feedback_trainer.secondary_failed",
+                kind=secondary_kind,
+                error=str(e),
+            )
 
-    # 3. Holdout test metrics using the calibrated logreg.
-    test_proba = lr_result.estimator.predict_proba(X_test)[:, 1]
+    # 3. Holdout test metrics using the calibrated primary.
+    test_proba = primary_result.estimator.predict_proba(X_test)[:, 1]
     test_pred = (test_proba >= confidence_threshold).astype(int)
     test_metrics = _evaluate_classification(
         y_test.values, test_proba, threshold=confidence_threshold
@@ -404,12 +434,12 @@ def train_candidate_from_feedback(
     )
 
     return CandidateTrainResult(
-        train_result=lr_result,
+        train_result=primary_result,
         boosted_train_result=boosted_result,
         realized_metrics=realized_metrics,
         test_metrics=test_metrics,
-        val_metrics=lr_result.aggregate_metrics,
-        calibration_table=lr_result.calibration_table,
+        val_metrics=primary_result.aggregate_metrics,
+        calibration_table=primary_result.calibration_table,
         feature_columns=list(FEATURE_COLUMNS),
         n_total=int(len(df)),
         n_train=int(len(train_idx)),

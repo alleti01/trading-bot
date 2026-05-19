@@ -27,7 +27,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional, Protocol
+from typing import Any, Callable, Optional, Protocol, Sequence
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -145,7 +145,8 @@ class PaperTradingLoop:
         *,
         settings: Settings,
         feed: IncrementalFeed,
-        strategy: Strategy,
+        strategy: Optional[Strategy] = None,
+        strategies: Optional[Sequence[Strategy]] = None,
         notifier: _NotifierLike,
         predictor: Optional[Predictor] = None,
         portfolio: Optional[Portfolio] = None,
@@ -154,9 +155,24 @@ class PaperTradingLoop:
         max_hold_bars: Optional[int] = None,
         high_risk_news_fn: Optional[Callable[[], bool]] = None,
     ) -> None:
+        # Accept either a single ``strategy=`` (the original API) or a
+        # list ``strategies=`` (multi-strategy paper mode). Internally
+        # ``self.strategies`` is always the canonical list; ``self.strategy``
+        # is preserved as the first element for back-compat with code that
+        # used to read it directly.
+        if strategies is None:
+            if strategy is None:
+                raise TypeError(
+                    "PaperTradingLoop requires either ``strategy=`` or ``strategies=``."
+                )
+            self.strategies: list[Strategy] = [strategy]
+        else:
+            if not strategies:
+                raise ValueError("strategies= must contain at least one strategy")
+            self.strategies = list(strategies)
+        self.strategy: Strategy = self.strategies[0]
         self.settings = settings
         self.feed = feed
-        self.strategy = strategy
         self.notifier = notifier
         self.predictor = predictor
         self.spec = get_instrument(settings.INSTRUMENT)
@@ -446,22 +462,89 @@ class PaperTradingLoop:
         if is_force_flat_due(now, self.settings) and self.settings.MARKET_TYPE == "futures":
             return
 
-        try:
-            setups = self.strategy.detect_setups(features)
-        except Exception as e:
-            self._record_error(result, "strategy.failed", e)
+        # Run every enabled strategy on the same feature frame and merge
+        # the latest-bar setups. Strategy failures are isolated: one
+        # broken plug-in cannot stop the others.
+        latest_setups: list[Setup] = []
+        for strategy in self.strategies:
+            try:
+                strategy_setups = strategy.detect_setups(features)
+            except Exception as e:
+                self._record_error(result, f"strategy.failed:{strategy.name}", e)
+                continue
+            latest_setups.extend(
+                s for s in strategy_setups if s.timestamp == latest_ts
+            )
+
+        result.setups_seen = len(latest_setups)
+        if not latest_setups:
             return
 
-        # Only consider setups for the latest bar — anything older was
-        # already handled on a prior tick (and re-emitting them would be
-        # an implicit lookahead).
-        latest_setups = [s for s in setups if s.timestamp == latest_ts]
-        result.setups_seen = len(latest_setups)
+        latest_setups = self._resolve_setup_conflicts(latest_setups, result)
         if not latest_setups:
             return
 
         for setup in latest_setups:
             self._handle_setup(setup, bar_series, now, result)
+
+    # ------------------------------------------------------------------
+    # Multi-strategy conflict resolution
+    # ------------------------------------------------------------------
+    def _resolve_setup_conflicts(
+        self, setups: list[Setup], result: BarCycleResult
+    ) -> list[Setup]:
+        """Drop opposing-direction setups on the same symbol.
+
+        With one strategy enabled there is rarely a conflict and this
+        function is a near no-op. With multiple strategies enabled the
+        registry's resolver enforces the rule that we never simultaneously
+        take long and short on the same instrument.
+
+        Score each candidate via the predictor first (when present) so
+        the resolver can break ties by approved confidence. Predictor
+        failures bubble up through ``_handle_setup`` later — at this
+        stage we only score for *resolution*; ``_handle_setup`` will
+        score again for the model gate. That double scoring is cheap
+        (one ``predict_proba`` call per candidate) and keeps the
+        per-setup error/notify/persist bookkeeping isolated from the
+        resolver.
+        """
+        if len(setups) <= 1:
+            return setups
+
+        # Lazy import: avoids hard-binding registry into loop boot when
+        # paper mode is constructed without it.
+        from strategies.registry import ScoredSetup, resolve_conflicts
+
+        scored: list[ScoredSetup] = []
+        for setup in setups:
+            confidence: Optional[float] = None
+            approved: Optional[bool] = None
+            if self.predictor is not None:
+                try:
+                    pred = self.predictor.predict_setup(setup)
+                    confidence = float(pred.probability)
+                    approved = bool(pred.approved)
+                except Exception as e:
+                    self.log.warning(
+                        "loop.predictor_score_failed_for_resolution",
+                        setup_id=setup.id,
+                        error=str(e),
+                    )
+            scored.append(ScoredSetup(setup=setup, confidence=confidence, approved=approved))
+
+        resolution = resolve_conflicts(scored)
+
+        for conflict in resolution.conflicts:
+            self.notifier.notify(
+                "strategy.conflict",
+                instrument=conflict.instrument,
+                reason=conflict.reason,
+                winner_setup_id=conflict.winner_setup_id,
+                dropped_setup_ids=conflict.dropped_setup_ids,
+            )
+
+        return [s.setup for s in resolution.survivors]
 
     def _handle_setup(
         self,
@@ -676,17 +759,27 @@ def build_paper_loop(
     model_name: Optional[str] = None,
     model_version: str = "latest",
     high_risk_news_fn: Optional[Callable[[], bool]] = None,
+    cli_strategy: Optional[str] = None,
 ) -> PaperTradingLoop:
     """Construct a :class:`PaperTradingLoop` with the project's defaults.
 
-    If a model is requested but loading fails, the returned loop has
-    ``trading_enabled=False`` and the failure is reported via the
-    notifier — the bot stays up, just without entries.
+    Strategies come from the registry: ``cli_strategy`` (operator
+    override via ``--strategy``) takes precedence, otherwise we use
+    ``settings.ENABLED_STRATEGIES``. If a model is requested but
+    loading fails, the returned loop has ``trading_enabled=False`` and
+    the failure is reported via the notifier — the bot stays up, just
+    without entries.
     """
-    from strategies.vwap_ema_pullback import VWAPEMAPullback  # local import: keeps boot snappy
+    from strategies.registry import instantiate_enabled
 
     log = get_logger("paper.loop_builder")
-    strategy = VWAPEMAPullback(instrument=settings.INSTRUMENT)
+    strategies = instantiate_enabled(
+        settings, instrument=settings.INSTRUMENT, cli_strategy=cli_strategy
+    )
+    log.info(
+        "paper.strategies_loaded",
+        names=[s.name for s in strategies],
+    )
 
     predictor: Optional[Predictor] = None
     trading_enabled = True
@@ -709,7 +802,7 @@ def build_paper_loop(
     loop = PaperTradingLoop(
         settings=settings,
         feed=feed,
-        strategy=strategy,
+        strategies=strategies,
         notifier=notifier,
         predictor=predictor,
         high_risk_news_fn=high_risk_news_fn,

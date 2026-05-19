@@ -123,12 +123,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Model version (default 'latest').",
     )
     parser.add_argument(
+        "--min-feedback-rows",
         "--feedback-min-rows",
+        dest="min_feedback_rows",
         type=int,
         default=None,
         help=(
             "Override FEEDBACK_MIN_ROWS for --retrain-from-feedback. Below "
-            "this many feedback rows the candidate trainer refuses to run."
+            "this many feedback rows the candidate trainer refuses to run "
+            "(alias: --feedback-min-rows)."
         ),
     )
     parser.add_argument(
@@ -141,12 +144,24 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--use-mistake-tags-as-label",
         "--feedback-use-mistake-tags",
+        dest="use_mistake_tags_as_label",
         action="store_true",
         help=(
             "When set, label = 0 for any trade carrying a mistake tag "
             "(default: label is derived from PnL only; tags are stored as "
-            "metadata)."
+            "metadata). Alias: --feedback-use-mistake-tags."
+        ),
+    )
+    parser.add_argument(
+        "--feedback-model-kind",
+        choices=["logreg", "lightgbm"],
+        default="logreg",
+        help=(
+            "Trainer to use for the saved candidate in "
+            "--retrain-from-feedback (default: logreg). 'lightgbm' "
+            "requires the optional lightgbm package."
         ),
     )
     parser.add_argument(
@@ -189,6 +204,18 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "MODE=TRAIN (default: settings.MAX_HOLD_BARS, or 20)."
         ),
     )
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        default=None,
+        help=(
+            "Strategy name (registry key). For MODE=TRAIN and MODE=BACKTEST "
+            "this picks the single strategy to run (default: "
+            "'vwap_ema_pullback'). For MODE=PAPER, omitting this flag uses "
+            "settings.ENABLED_STRATEGIES; passing it forces paper mode to "
+            "run only the named strategy."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -203,7 +230,7 @@ def _run_smoke_features(settings: Settings, log) -> int:
     """Day-2 smoke pass: synthetic OHLCV → features → strategy."""
     # Local imports keep CLI startup snappy and avoid hard deps from --dry-run.
     from features.feature_builder import FEATURE_COLUMNS, build_features
-    from strategies.vwap_ema_pullback import VWAPEMAPullback
+    from strategies.registry import instantiate as instantiate_strategy
     from tests.fixtures.synthetic import synthetic_ohlcv
 
     df = synthetic_ohlcv(n_bars=500, tz=settings.TIMEZONE)
@@ -224,7 +251,7 @@ def _run_smoke_features(settings: Settings, log) -> int:
         non_null_cells=int(features[list(FEATURE_COLUMNS)].notna().sum().sum()),
     )
 
-    strategy = VWAPEMAPullback(instrument=settings.INSTRUMENT)
+    strategy = instantiate_strategy("vwap_ema_pullback", instrument=settings.INSTRUMENT)
     setups = strategy.detect_setups(features)
     by_dir: dict[str, int] = {"long": 0, "short": 0}
     for s in setups:
@@ -250,7 +277,7 @@ def _run_smoke_train(settings: Settings, log) -> int:
     from models.model_registry import load_model, save_model
     from models.predictor import Predictor
     from models.trainer import has_lightgbm, train
-    from strategies.vwap_ema_pullback import VWAPEMAPullback
+    from strategies.registry import instantiate as instantiate_strategy
     from tests.fixtures.synthetic import synthetic_ohlcv
     from validation.time_split import chronological_split
     from validation.walk_forward import walk_forward_splits
@@ -261,7 +288,7 @@ def _run_smoke_train(settings: Settings, log) -> int:
     features = build_features(df, instrument=settings.INSTRUMENT, tz=settings.TIMEZONE)
     log.info("smoke.features", rows=len(features))
 
-    strategy = VWAPEMAPullback(instrument=settings.INSTRUMENT)
+    strategy = instantiate_strategy("vwap_ema_pullback", instrument=settings.INSTRUMENT)
     setups = strategy.detect_setups(features)
     log.info(
         "smoke.setups",
@@ -380,23 +407,37 @@ def _run_backtest(
     model_name: Optional[str],
     model_version: str,
     timeframe: str,
+    strategy_name: str = "vwap_ema_pullback",
 ) -> int:
-    """Shared backtest core used by both --smoke-backtest and --backtest-csv."""
+    """Shared backtest core used by both --smoke-backtest and --backtest-csv.
+
+    The strategy is resolved through ``strategies.registry`` so adding a
+    new strategy needs no edits here. Multi-strategy backtest is a
+    deliberate later step — this function still uses a single named
+    strategy.
+    """
     from backtesting.engine import BacktestEngine
     from features.feature_builder import build_features
     from models.model_registry import load_model
     from models.predictor import Predictor
     from reports.backtest_report import write_backtest_report
-    from strategies.vwap_ema_pullback import VWAPEMAPullback
+    from strategies.registry import instantiate as instantiate_strategy
+
+    try:
+        strategy = instantiate_strategy(strategy_name, instrument=settings.INSTRUMENT)
+    except KeyError as e:
+        log.error("backtest.unknown_strategy", error=str(e))
+        return 4
 
     features = build_features(
         ohlcv_df, instrument=settings.INSTRUMENT, tz=settings.TIMEZONE
     )
     log.info("backtest.features_built", rows_in=len(ohlcv_df), rows_out=len(features))
 
-    setups = VWAPEMAPullback(instrument=settings.INSTRUMENT).detect_setups(features)
+    setups = strategy.detect_setups(features)
     log.info(
         "backtest.setups",
+        strategy=strategy.name,
         n=len(setups),
         long=sum(s.direction == "long" for s in setups),
         short=sum(s.direction == "short" for s in setups),
@@ -472,6 +513,7 @@ def _run_backtest_from_csv(
     csv_path: str,
     model_name: Optional[str],
     model_version: str,
+    strategy_name: str = "vwap_ema_pullback",
 ) -> int:
     from pathlib import Path
 
@@ -503,6 +545,7 @@ def _run_backtest_from_csv(
         model_name=model_name,
         model_version=model_version,
         timeframe="1m",
+        strategy_name=strategy_name,
     )
 
 
@@ -548,6 +591,7 @@ def _run_smoke_paper(settings: Settings, log, *, args: argparse.Namespace) -> in
         notifier=notifier,
         model_name=args.model_name,
         model_version=args.model_version,
+        cli_strategy=args.strategy,
     )
     service = SchedulerService(
         settings=settings, loop=loop, notifier=notifier, blocking=False
@@ -673,6 +717,7 @@ def _run_paper_forever(settings: Settings, log, *, args: argparse.Namespace) -> 
         model_name=args.model_name,
         model_version=args.model_version,
         high_risk_news_fn=orchestrator.high_risk_news_active,
+        cli_strategy=args.strategy,
     )
 
     # Day 8: per-trade analysis. Reuses the same LLM client built for the
@@ -974,10 +1019,11 @@ def _run_retrain_from_feedback(settings: Settings, log, *, args=None) -> int:
       registry pointer. Promotion requires the explicit
       ``--promote-model VERSION`` CLI step, which itself re-runs the
       gate check.
-    - Refuses to run on too few rows (``FEEDBACK_MIN_ROWS``).
+    - Refuses to run on too few rows (``FEEDBACK_MIN_ROWS`` or
+      ``--min-feedback-rows``).
     - Splits chronologically only — never randomly.
     - Mistake tags become metadata; they only become labels when the
-      operator opts in via ``--feedback-use-mistake-tags``.
+      operator opts in via ``--use-mistake-tags-as-label``.
     """
     from pathlib import Path
 
@@ -989,19 +1035,32 @@ def _run_retrain_from_feedback(settings: Settings, log, *, args=None) -> int:
     from analysis.promotion import compare, write_comparison_report
     from models.model_registry import load_model, save_model
 
-    incumbent_name = (args.model_name if args else None) or "vwap_ema_pullback_lr"
+    if args is None or not args.model_name:
+        log.error(
+            "retrain.missing_model_name",
+            note=(
+                "--retrain-from-feedback requires --model-name (the "
+                "incumbent's registry name; the candidate is saved as "
+                "'<model-name>_candidate' unless --candidate-model-name "
+                "is given)."
+            ),
+        )
+        return 4
+
+    incumbent_name = args.model_name
     candidate_name = (
-        (args.candidate_model_name if args else None) or f"{incumbent_name}_candidate"
+        getattr(args, "candidate_model_name", None) or f"{incumbent_name}_candidate"
     )
     min_rows = (
-        int(args.feedback_min_rows)
-        if (args and args.feedback_min_rows is not None)
+        int(args.min_feedback_rows)
+        if args.min_feedback_rows is not None
         else int(settings.FEEDBACK_MIN_ROWS)
     )
     use_mistake_tags = bool(
-        (args.feedback_use_mistake_tags if args else False)
+        getattr(args, "use_mistake_tags_as_label", False)
         or settings.FEEDBACK_USE_MISTAKE_TAGS_AS_LABEL
     )
+    model_kind = getattr(args, "feedback_model_kind", "logreg")
 
     dataset = FeedbackDataset()
     rows = dataset.build()
@@ -1026,7 +1085,7 @@ def _run_retrain_from_feedback(settings: Settings, log, *, args=None) -> int:
             note=(
                 "Need >= FEEDBACK_MIN_ROWS closed trades before retraining. "
                 "Run paper mode longer (target ~2-4 weeks of trading days for "
-                "the default of 100) or pass --feedback-min-rows to override."
+                "the default of 100) or pass --min-feedback-rows to override."
             ),
         )
         return 4
@@ -1037,6 +1096,7 @@ def _run_retrain_from_feedback(settings: Settings, log, *, args=None) -> int:
             min_rows=min_rows,
             confidence_threshold=settings.CONFIDENCE_THRESHOLD,
             use_mistake_tags_as_label=use_mistake_tags,
+            model_kind=model_kind,
         )
     except InsufficientFeedbackError as e:
         log.error(
@@ -1053,10 +1113,11 @@ def _run_retrain_from_feedback(settings: Settings, log, *, args=None) -> int:
     # candidate. ``save_model`` will merge this into ``metadata.json``.
     extra_metadata = {
         "candidate": True,
-        "source": "feedback_dataset",
+        "source": "feedback",
         "incumbent_name": incumbent_name,
+        "model_kind": model_kind,
         "label_strategy": candidate.label_strategy,
-        "feedback_min_rows": min_rows,
+        "min_feedback_rows": min_rows,
         "n_total": candidate.n_total,
         "n_train": candidate.n_train,
         "n_val": candidate.n_val,
@@ -1084,6 +1145,7 @@ def _run_retrain_from_feedback(settings: Settings, log, *, args=None) -> int:
         "retrain.candidate_saved",
         name=candidate_name,
         version=candidate_version,
+        model_kind=model_kind,
         n_train=candidate.n_train,
         n_test=candidate.n_test,
         test_precision=round(candidate.test_metrics["precision"], 4),
@@ -1150,7 +1212,8 @@ def _run_train_from_csv(settings: Settings, log, args) -> int:
     1. Load + validate the CSV (timestamp, open, high, low, close,
        volume) via ``data.csv_loader.load_ohlcv_csv``.
     2. Build canonical features.
-    3. Detect setups using ``VWAPEMAPullback``.
+    3. Detect setups using the strategy resolved through the registry
+       (``--strategy`` CLI flag, default ``vwap_ema_pullback``).
     4. Label setups with TP/SL/time using ``label_setups`` and
        ``--max-hold-bars`` (default: ``settings.MAX_HOLD_BARS``).
     5. Build X (FEATURE_COLUMNS) + y (0/1) from the setup feature
@@ -1176,7 +1239,7 @@ def _run_train_from_csv(settings: Settings, log, args) -> int:
     from labeling.tp_sl_labeler import label_setups
     from models.model_registry import save_model
     from models.trainer import has_lightgbm, train
-    from strategies.vwap_ema_pullback import VWAPEMAPullback
+    from strategies.registry import instantiate as instantiate_strategy
     from validation.time_split import chronological_split
     from validation.walk_forward import walk_forward_splits
 
@@ -1298,7 +1361,12 @@ def _run_train_from_csv(settings: Settings, log, args) -> int:
     )
 
     # ---- 3. Setups ---------------------------------------------------------
-    strategy = VWAPEMAPullback(instrument=settings.INSTRUMENT)
+    strategy_name = getattr(args, "strategy", None) or "vwap_ema_pullback"
+    try:
+        strategy = instantiate_strategy(strategy_name, instrument=settings.INSTRUMENT)
+    except KeyError as e:
+        log.error("train.unknown_strategy", error=str(e))
+        return 4
     setups = strategy.detect_setups(features)
     by_dir: dict[str, int] = {"long": 0, "short": 0}
     for s in setups:
@@ -1679,6 +1747,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 csv_path=args.backtest_csv,
                 model_name=args.model_name,
                 model_version=args.model_version,
+                strategy_name=args.strategy or "vwap_ema_pullback",
             )
         log.warning(
             "backtest.no_input",
