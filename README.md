@@ -312,6 +312,15 @@ Webhooks are an *additional* signal source — the bot's primary
 scanner is the per-symbol paper loop, which polls feeds on the
 configured cadence regardless of whether any webhook is wired.
 
+There are two layers:
+
+1. **Validator** — `webhook.validate_webhook_signal(...)`. Pure
+   function; turns a JSON payload into a typed `WebhookSignal` and
+   filters by `ENABLED_SYMBOLS`. Suitable for embedding in any
+   HTTP layer.
+2. **HTTP endpoint** — the `webhooks/` package ships a FastAPI app
+   that wraps the validator with risk gating + paper-trade execution.
+
 ```python
 from webhook import validate_webhook_signal
 from config.instruments import SymbolUniverse
@@ -324,7 +333,7 @@ signal = validate_webhook_signal(
 )
 ```
 
-Behavior:
+Validator behavior:
 
 - **Symbols not in `ENABLED_SYMBOLS` are rejected** with
   `InvalidWebhookSignal`. The bot never trades a symbol operations
@@ -333,9 +342,196 @@ Behavior:
   a bad shared secret all produce `InvalidWebhookSignal` (HTTP layers
   should map this to `400 Bad Request`).
 - `direction` accepts both `long`/`short` and `buy`/`sell`.
-- An accepted signal returns a typed :class:`WebhookSignal` ready
-  to be turned into a setup by the caller. Live broker execution is
-  out of scope; the MVP only paper-trades.
+- An accepted signal returns a typed `WebhookSignal` ready to be
+  turned into a setup by the caller. Live broker execution is out
+  of scope; the MVP only paper-trades.
+
+## TradingView webhook server
+
+The `webhooks/` package adds a runnable FastAPI app that ingests
+TradingView alerts and converts them into paper trades through the
+exact same risk engine the paper loop uses. The endpoint never
+talks to a live broker — even when `MODE=LIVE` (live mode is locked
+behind a separate flag and the live executor is a placeholder).
+
+### Endpoint
+
+```
+POST /webhooks/tradingview
+```
+
+Body shape (TradingView's standard alert message JSON):
+
+```json
+{
+  "secret": "your-shared-secret",
+  "source": "tradingview",
+  "symbol": "MNQ1!",
+  "time": "{{time}}",
+  "price": "{{close}}",
+  "action": "long",
+  "strategy": "vwap_pullback",
+  "timeframe": "{{interval}}",
+  "stop": "{{plot('stop')}}",
+  "target": "{{plot('target')}}"
+}
+```
+
+- `action` is one of `long` / `short` / `close` (`buy` / `sell` are
+  accepted as aliases).
+- `secret` is checked against `TRADINGVIEW_WEBHOOK_SECRET`. Can also
+  be sent as the `X-Webhook-Secret` header. When the env var is
+  unset the secret check is skipped (do not run open to the
+  internet without a secret).
+- `stop` / `target` are optional. When omitted they default to
+  `WEBHOOK_DEFAULT_STOP_TICKS` / `WEBHOOK_DEFAULT_TARGET_TICKS`
+  ticks from `price`. Always include them in your alert message
+  for accurate execution.
+
+### Pipeline (per request)
+
+```
+receive  ->  validate (FastAPI 422 on bad shape)
+         ->  check TRADINGVIEW_WEBHOOK_SECRET           (401 on mismatch)
+         ->  normalize symbol  ("MNQ1!" -> "MNQ", etc.)
+         ->  reject if symbol not in ENABLED_SYMBOLS
+         ->  optional model gate (off by default — webhook signals
+                                  do not carry a feature snapshot)
+         ->  risk_engine.evaluate(...)                  authoritative
+         ->  PaperExecutor.submit(...)                  paper-only
+```
+
+Symbol normalization handles TradingView's front-month continuous
+suffixes and exchange prefixes:
+
+| Input               | Output |
+| ------------------- | ------ |
+| `MNQ1!`, `MES1!`    | `MNQ`, `MES` |
+| `NQ1!`, `ES1!`      | `NQ`, `ES`   |
+| `BINANCE:BTCUSDT`   | `BTC` (when `MARKET_TYPE=crypto`) |
+| `ETH/USDT`          | `ETH` (when `MARKET_TYPE=crypto`) |
+
+### Notifications
+
+Every webhook touch emits a notification (Discord + the
+`notifications` audit table) so operators can replay an alert end
+to end:
+
+| Kind                   | Trigger                                  |
+| ---------------------- | ---------------------------------------- |
+| `webhook.received`     | Payload arrived (before validation).     |
+| `webhook.invalid`      | Bad secret / unknown symbol / bad shape. |
+| `webhook.approved`     | Risk engine accepted, before submit.     |
+| `webhook.blocked`      | Risk engine refused, with rule + reason. |
+| `webhook.trade_opened` | PaperExecutor filled an entry.           |
+| `webhook.closed`       | `action=close` flattened a position.     |
+
+A failing notifier (e.g. Discord 5xx) never propagates: the
+endpoint always returns a structured `WebhookResponse`.
+
+### Run a local server
+
+```bash
+# Install deps if you haven't already
+pip install -r requirements.txt
+
+# Configure the universe + secret in .env
+ENABLED_SYMBOLS=MES,MNQ,MGC
+PRIMARY_SYMBOL=MES
+TRADINGVIEW_WEBHOOK_SECRET=replace-me-with-something-random
+DISCORD_WEBHOOK_URL=...        # optional but recommended
+MODE=PAPER
+
+# Boot the FastAPI app — uvicorn entry uses webhooks.create_app
+python -m uvicorn "webhooks:create_app" --factory --host 127.0.0.1 --port 8000
+```
+
+The standalone server runs its own in-process `PaperExecutor` —
+its portfolio is **not** shared with the per-symbol paper loop.
+For a single combined process (paper loop + webhook ingest sharing
+state) build the app from your own service code:
+
+```python
+from webhooks import build_webhook_router
+
+router = build_webhook_router(
+    settings=settings,
+    universe=universe,
+    executor=paper_loop_executor,           # share with paper loop
+    notifier_notify=notifier.notify,
+    high_risk_news_fn=orchestrator.high_risk_news_active,
+)
+fastapi_app.include_router(router)
+```
+
+### Expose the server to TradingView
+
+TradingView only POSTs to public URLs. Use a tunnel:
+
+**Option A: ngrok**
+
+```bash
+# Free plan is enough for testing.
+ngrok http 8000
+# -> Forwarding https://<random>.ngrok-free.app -> http://localhost:8000
+```
+
+Use `https://<random>.ngrok-free.app/webhooks/tradingview` as the
+alert URL.
+
+**Option B: Cloudflare Tunnel** (recommended for longer runs)
+
+```bash
+brew install cloudflared            # or your platform's package manager
+cloudflared tunnel --url http://localhost:8000
+# -> https://<your-tunnel>.trycloudflare.com
+```
+
+Use `https://<your-tunnel>.trycloudflare.com/webhooks/tradingview`.
+
+For production-style runs, set up a named tunnel + DNS record so
+the URL doesn't change on each restart.
+
+### Create a TradingView alert
+
+1. Open the chart for a symbol you have enabled (e.g. `CME_MINI:MES1!`).
+2. Add the alert (Alt-A on a chart). Set "Condition" to your
+   indicator / strategy of choice.
+3. In **Notifications** -> **Webhook URL**, paste your tunnel URL +
+   `/webhooks/tradingview`.
+4. In **Message**, paste this JSON. TradingView substitutes the
+   `{{...}}` placeholders at fire time:
+
+   ```json
+   {
+     "secret": "replace-me-with-something-random",
+     "source": "tradingview",
+     "symbol": "{{ticker}}",
+     "time": "{{time}}",
+     "price": "{{close}}",
+     "action": "long",
+     "strategy": "{{strategy.order.alert_message}}",
+     "timeframe": "{{interval}}"
+   }
+   ```
+
+5. Save. When the condition fires TradingView POSTs the JSON above
+   to your bot.
+
+### Security warnings
+
+- **Do not put broker credentials, API keys, or account numbers in
+  TradingView alert messages.** TradingView stores alert text
+  server-side and surfaces it in their UI; treat it as
+  semi-public.
+- Always set `TRADINGVIEW_WEBHOOK_SECRET` and run the bot behind
+  HTTPS (ngrok / Cloudflare Tunnel both terminate TLS for you).
+  The secret is only useful when the channel is encrypted —
+  otherwise an on-path observer can replay it.
+- Rotate the secret if it ever appears in a screenshot, gist, or
+  shared chart.
+- Keep the host firewalled to localhost (the tunnel does the
+  public-facing job). Do not bind uvicorn to `0.0.0.0` in dev.
 
 ## Strategies
 
@@ -744,6 +940,12 @@ vars). See `.env.example` for the full list with comments. Key knobs:
   (default 100). Below this the trainer refuses to run.
 - `FEEDBACK_USE_MISTAKE_TAGS_AS_LABEL` — when true, derive candidate
   labels from mistake tags (default false; tags are metadata only).
+- `TRADINGVIEW_WEBHOOK_SECRET` — shared secret for the
+  `POST /webhooks/tradingview` endpoint. When unset, the secret check
+  is skipped (do **not** expose the endpoint publicly without one).
+- `WEBHOOK_DEFAULT_STOP_TICKS` / `WEBHOOK_DEFAULT_TARGET_TICKS` —
+  fallback stop / target distance (in instrument ticks) used when a
+  TradingView alert payload omits `stop` / `target` (defaults 20 / 40).
 
 ## Adding historical CSV data
 
@@ -828,5 +1030,7 @@ reports/                daily report, trade journal, backtest report,
                         per-trade post-mortem, daily mistake digest
 scheduler/              APScheduler service + market hours
 storage/                SQLAlchemy engine + ORM tables
-tests/                  pytest tests (220+ covering all the above)
+webhook/                lightweight TradingView payload validator
+webhooks/               FastAPI ingest app for TradingView alerts
+tests/                  pytest tests (430+ covering all the above)
 ```

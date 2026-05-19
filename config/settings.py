@@ -127,6 +127,26 @@ class Settings(BaseSettings):
     # ---- Notifications -------------------------------------------------
     DISCORD_WEBHOOK_URL: Optional[SecretStr] = None
 
+    # ---- TradingView webhook ------------------------------------------
+    # Optional shared secret for the ``POST /webhooks/tradingview`` endpoint.
+    # When set, every incoming webhook MUST carry a matching ``secret``
+    # field (or a same-value header) or the request is rejected before it
+    # touches the trading pipeline.
+    #
+    # Operational note: TradingView alert messages travel over plain HTTP
+    # to whatever URL you configure, so the secret is only useful when
+    # the bot is behind HTTPS (ngrok / Cloudflare Tunnel / a real LB).
+    # Treat it as "this signal is from my alert", not "this signal is
+    # cryptographically authenticated."
+    TRADINGVIEW_WEBHOOK_SECRET: Optional[SecretStr] = None
+    # Default stop/target distance in instrument ticks when a webhook
+    # payload omits ``stop`` / ``target``. The repo's risk engine
+    # requires a stop, so we synthesize one rather than refusing the
+    # signal outright. Operators that care about stop placement should
+    # include explicit ``stop`` / ``target`` in the alert message.
+    WEBHOOK_DEFAULT_STOP_TICKS: int = Field(default=20, ge=1)
+    WEBHOOK_DEFAULT_TARGET_TICKS: int = Field(default=40, ge=1)
+
     # ---- Paper service (Day 5) ----------------------------------------
     BAR_INTERVAL_SECONDS: int = Field(default=60, ge=1)
     ROLLING_WINDOW_BARS: int = Field(default=500, ge=50)
