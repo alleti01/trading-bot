@@ -23,6 +23,9 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 Mode = Literal["BACKTEST", "TRAIN", "PAPER", "LIVE"]
 MarketType = Literal["futures", "crypto"]
+WorkflowExecutionMode = Literal["DRY_RUN", "PAPER", "LIVE"]
+BrokerProvider = Literal["mock", "alpaca", "tradovate"]
+DefaultOrderType = Literal["limit", "market"]
 
 
 class Settings(BaseSettings):
@@ -197,6 +200,58 @@ class Settings(BaseSettings):
     # ``DataQualityAgent`` never calls an LLM by default.
     DATA_QUALITY_AGENT_MODEL: Optional[str] = "none"
 
+    # ---- Autonomous workflows (paper-first orchestration) --------------
+    # Separate from ``MODE`` — workflows can run in DRY_RUN while the
+    # core bot is in PAPER. LIVE is always refused by the workflow runner.
+    WORKFLOW_EXECUTION_MODE: WorkflowExecutionMode = "DRY_RUN"
+    WORKFLOW_TIMEZONE: str = "America/New_York"
+    WORKFLOW_WEEKDAYS_ONLY: bool = True
+    WORKFLOW_GIT_COMMIT: bool = False
+    WORKFLOW_GIT_PUSH: bool = False
+    # When true, pre-market may call MacroNewsAgent (requires LLM keys).
+    PERPLEXITY_ENABLED: bool = False
+    # Master switch for workflow-driven paper order placement.
+    AUTONOMOUS_TRADING_ENABLED: bool = False
+    # Safety rail: autonomous execution only when execution mode is PAPER.
+    AUTONOMOUS_PAPER_ONLY: bool = True
+    # Memory directory for strategy/research/trade logs.
+    WORKFLOW_MEMORY_DIR: Path = Path("./memory")
+
+    # ---- Broker adapter (paper/demo only) ------------------------------
+    # ``BROKER_PROVIDER`` selects the integration used by the workflow
+    # layer for order placement. ``mock`` is the default — every method
+    # returns simulated JSON without touching the network. ``tradovate``
+    # is permitted ONLY when the demo URL + ``TRADOVATE_DEMO=true`` are
+    # both set (enforced by :class:`TradovateDemoClient`).
+    BROKER_PROVIDER: BrokerProvider = "mock"
+    DEFAULT_ORDER_TYPE: DefaultOrderType = "limit"
+    BROKER_REQUEST_TIMEOUT_SECONDS: float = Field(default=15.0, gt=0.0)
+
+    # ---- Tradovate (demo / simulation only) ----------------------------
+    # The bot refuses to call Tradovate unless ``TRADOVATE_DEMO=true``
+    # AND the base URL points at ``demo.tradovateapi.com``. There is no
+    # live path: live execution is locked at the workflow runner and
+    # again inside the broker router.
+    TRADOVATE_USERNAME: Optional[str] = None
+    TRADOVATE_PASSWORD: Optional[SecretStr] = None
+    TRADOVATE_APP_ID: Optional[str] = None
+    TRADOVATE_APP_VERSION: str = "1.0.0"
+    TRADOVATE_CLIENT_ID: Optional[str] = None
+    TRADOVATE_CLIENT_SECRET: Optional[SecretStr] = None
+    TRADOVATE_DEMO: bool = True
+    TRADOVATE_BASE_URL: str = "https://demo.tradovateapi.com/v1"
+    TRADOVATE_WS_URL: str = "wss://demo.tradovateapi.com/v1/websocket"
+
+    # ---- Alpaca (PAPER / sandbox only) ---------------------------------
+    # Alpaca is the current paper-automation broker because Tradovate
+    # demo credentials require a funded account. The adapter refuses
+    # to act unless ``ALPACA_PAPER=true`` AND the base URL points at
+    # ``paper-api.alpaca.markets``. Live execution is locked.
+    ALPACA_API_KEY: Optional[SecretStr] = None
+    ALPACA_SECRET_KEY: Optional[SecretStr] = None
+    ALPACA_PAPER: bool = True
+    ALPACA_BASE_URL: str = "https://paper-api.alpaca.markets"
+
     # ---- Notifications -------------------------------------------------
     DISCORD_WEBHOOK_URL: Optional[SecretStr] = None
 
@@ -258,7 +313,7 @@ class Settings(BaseSettings):
             raise ValueError(f"Invalid time '{v}', expected HH:MM") from e
         return v
 
-    @field_validator("TIMEZONE")
+    @field_validator("TIMEZONE", "WORKFLOW_TIMEZONE")
     @classmethod
     def _validate_tz(cls, v: str) -> str:
         try:
@@ -266,6 +321,39 @@ class Settings(BaseSettings):
         except Exception as e:
             raise ValueError(f"Invalid timezone '{v}'") from e
         return v
+
+    @field_validator("BROKER_PROVIDER", mode="before")
+    @classmethod
+    def _normalize_broker_provider(cls, v: object) -> str:
+        s = str(v or "mock").strip().lower()
+        allowed = {"mock", "alpaca", "tradovate"}
+        if s not in allowed:
+            raise ValueError(
+                f"Invalid BROKER_PROVIDER '{v}'. Allowed: {sorted(allowed)}."
+            )
+        return s
+
+    @field_validator("DEFAULT_ORDER_TYPE", mode="before")
+    @classmethod
+    def _normalize_default_order_type(cls, v: object) -> str:
+        s = str(v or "limit").strip().lower()
+        if s not in {"limit", "market"}:
+            raise ValueError(
+                f"Invalid DEFAULT_ORDER_TYPE '{v}'. Allowed: ['limit', 'market']."
+            )
+        return s
+
+    @field_validator("WORKFLOW_EXECUTION_MODE", mode="before")
+    @classmethod
+    def _normalize_workflow_execution_mode(cls, v: object) -> str:
+        s = str(v or "DRY_RUN").strip().upper()
+        allowed = {"DRY_RUN", "PAPER", "LIVE"}
+        if s not in allowed:
+            raise ValueError(
+                f"Invalid WORKFLOW_EXECUTION_MODE '{v}'. "
+                f"Allowed: {sorted(allowed)}."
+            )
+        return s
 
     @field_validator("ENABLED_STRATEGIES", mode="before")
     @classmethod
@@ -377,6 +465,9 @@ class Settings(BaseSettings):
 
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.TIMEZONE)
+
+    def workflow_tz(self) -> ZoneInfo:
+        return ZoneInfo(self.WORKFLOW_TIMEZONE)
 
     # ----------------------------------------------------------------------
     # Agent provider/model accessors

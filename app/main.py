@@ -216,6 +216,47 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "run only the named strategy."
         ),
     )
+    parser.add_argument(
+        "--workflow",
+        choices=[
+            "premarket",
+            "market-open",
+            "midday",
+            "daily-summary",
+            "weekly-review",
+            "run-day",
+        ],
+        default=None,
+        help=(
+            "Run one autonomous workflow and exit. Separate from MODE= "
+            "train/backtest/paper; defaults to DRY_RUN unless "
+            "--no-workflow-dry-run is set."
+        ),
+    )
+    parser.add_argument(
+        "--workflow-scheduler",
+        action="store_true",
+        help=(
+            "Start the workflow APScheduler (pre-market, open, midday, "
+            "EOD, weekly). Blocks until interrupted."
+        ),
+    )
+    parser.add_argument(
+        "--workflow-dry-run",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When true (default), workflows write memory + Discord only — "
+            "no paper orders. Use --no-workflow-dry-run with "
+            "WORKFLOW_EXECUTION_MODE=PAPER and AUTONOMOUS_TRADING_ENABLED=true "
+            "to allow workflow paper entries."
+        ),
+    )
+    parser.add_argument(
+        "--workflow-force",
+        action="store_true",
+        help="Force workflow to run (e.g. weekly-review on non-Friday).",
+    )
     return parser.parse_args(argv)
 
 
@@ -1744,6 +1785,57 @@ def _run_promote_model(settings: Settings, log, *, args) -> int:
     return 0
 
 
+def _run_workflow_cli(settings: Settings, log, *, args: argparse.Namespace) -> int:
+    """Run autonomous workflows (separate from MODE train/backtest/paper loop)."""
+    from workflows.scheduler import WorkflowScheduler
+    from workflows.workflow_runner import WorkflowRunner
+
+    if settings.WORKFLOW_EXECUTION_MODE == "LIVE":
+        log.error(
+            "workflow.live_refused",
+            note="WORKFLOW_EXECUTION_MODE=LIVE is locked. Use DRY_RUN or PAPER.",
+        )
+        return 6
+
+    runner = WorkflowRunner.from_settings(
+        settings,
+        cli_dry_run=args.workflow_dry_run,
+    )
+    log.info(
+        "workflow.cli",
+        workflow=args.workflow,
+        scheduler=args.workflow_scheduler,
+        dry_run=runner.dry_run,
+        execution_mode=runner.execution_mode(),
+        autonomous=settings.AUTONOMOUS_TRADING_ENABLED,
+    )
+
+    if args.workflow_scheduler:
+        sched = WorkflowScheduler(settings, runner, blocking=True)
+        sched.run_forever()
+        return 0
+
+    if not args.workflow:
+        log.error("workflow.missing_name", note="Pass --workflow NAME or --workflow-scheduler")
+        return 4
+
+    result = runner.run(
+        args.workflow,
+        force=bool(args.workflow_force),
+    )
+    if not result.success and not result.skipped:
+        log.error("workflow.failed", workflow=args.workflow, errors=result.errors)
+        return 5
+    log.info(
+        "workflow.complete",
+        workflow=args.workflow,
+        success=result.success,
+        skipped=result.skipped,
+        dry_run=result.dry_run,
+    )
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
 
@@ -1806,6 +1898,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.promote_model:
         return _run_promote_model(settings, log, args=args)
+
+    if args.workflow or args.workflow_scheduler:
+        return _run_workflow_cli(settings, log, args=args)
 
     if settings.MODE == "TRAIN":
         return _run_train_from_csv(settings, log, args)

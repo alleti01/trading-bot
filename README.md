@@ -306,6 +306,155 @@ positives, and risk blocks per symbol. The Markdown render adds a
 Discord EOD message (`eod.summary`) carries the same `by_symbol`
 list so operators see which symbol paid the bills today.
 
+### Broker adapters (paper/demo only)
+
+Workflows are broker-agnostic — they only talk to
+`integrations.broker_router.build_broker(settings)`. The router picks
+an adapter based on `BROKER_PROVIDER`:
+
+| `BROKER_PROVIDER` | When to use | Asset class | Status |
+|-------------------|-------------|-------------|--------|
+| `mock`            | Default for DRY_RUN, tests, local simulation | any | Always available |
+| `alpaca`          | Current paper-automation sandbox | US **equities** (no futures) | Requires Alpaca paper keys |
+| `tradovate`       | Future futures execution / funded-account-compatible | Futures (MES/MNQ/etc.) | Requires Tradovate demo API access |
+
+LIVE is always refused regardless of provider — the router raises
+`LiveExecutionRefused` and the workflow runner refuses to build a
+context.
+
+#### Alpaca PAPER (current sandbox)
+
+Use Alpaca while Tradovate demo API access is unavailable. The
+adapter refuses to construct unless **all** rails pass:
+
+- `ALPACA_PAPER=true`
+- `ALPACA_BASE_URL` contains `paper-api.alpaca.markets`
+- `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` are set
+
+`.env`:
+
+```ini
+BROKER_PROVIDER=alpaca
+WORKFLOW_EXECUTION_MODE=PAPER
+AUTONOMOUS_TRADING_ENABLED=true
+ALPACA_API_KEY=your-paper-key
+ALPACA_SECRET_KEY=your-paper-secret
+ALPACA_PAPER=true
+ALPACA_BASE_URL=https://paper-api.alpaca.markets
+```
+
+> **Alpaca does not support futures.** Symbols `MES, MNQ, ES, NQ,
+> MGC, MCL, MYM, M2K` are rejected at every order method with the
+> message *"Alpaca adapter does not support futures. Use local
+> simulator or futures broker adapter."* For futures, run the local
+> mock adapter or wait until Tradovate demo credentials are
+> available.
+
+#### Tradovate DEMO (future-use)
+
+Kept for futures/funded-account-compatible execution. Construction
+requires demo credentials and `demo.tradovateapi.com` in the URL —
+both unavailable until you have a funded Tradovate account, but the
+adapter and config are wired so the path is ready.
+
+```ini
+BROKER_PROVIDER=tradovate
+TRADOVATE_DEMO=true
+TRADOVATE_BASE_URL=https://demo.tradovateapi.com/v1
+TRADOVATE_USERNAME=...
+TRADOVATE_PASSWORD=...
+TRADOVATE_APP_ID=...
+TRADOVATE_APP_VERSION=1.0.0
+TRADOVATE_CLIENT_ID=...
+TRADOVATE_CLIENT_SECRET=...
+```
+
+#### Smoke commands
+
+```bash
+python -m app.main --workflow premarket          # DRY_RUN, mock, no orders
+python -m app.main --workflow run-day            # full DRY_RUN sequence
+# Live workflow paper orders (Alpaca example):
+WORKFLOW_EXECUTION_MODE=PAPER BROKER_PROVIDER=alpaca \
+AUTONOMOUS_TRADING_ENABLED=true \
+python -m app.main --workflow market-open --no-workflow-dry-run
+```
+
+> Workflows must call only `broker_router`. A test
+> (`tests/test_workflow_broker_isolation.py`) fails the build if any
+> file under `workflows/` imports `AlpacaPaperClient`,
+> `TradovateDemoClient`, or `MockBroker` directly.
+
+### Tradovate DEMO/PAPER broker adapter
+
+The bot executes paper futures orders **directly through the
+Tradovate demo API** — TradingView is not in the execution path.
+
+```
+Python bot → Tradovate demo API → simulated futures fills → Discord
+```
+
+- **DRY_RUN** (default): the broker router always returns the
+  in-memory `MockBroker`. No network calls, no Tradovate auth, no
+  external orders.
+- **PAPER + `BROKER_PROVIDER=tradovate`**: the router builds a
+  `TradovateDemoClient` only when **all** safety rails pass:
+  - `TRADOVATE_DEMO=true`
+  - `TRADOVATE_BASE_URL` contains `demo.tradovateapi.com`
+  - `TRADOVATE_USERNAME` / `TRADOVATE_PASSWORD` / `TRADOVATE_APP_ID` set
+- **LIVE**: the router raises `LiveExecutionRefused` immediately.
+  The existing repo-wide LIVE lockout still applies.
+
+`.env` block (paper/demo only — never commit real credentials):
+
+```ini
+BROKER_PROVIDER=tradovate
+DEFAULT_ORDER_TYPE=limit
+TRADOVATE_USERNAME=your-demo-user
+TRADOVATE_PASSWORD=your-demo-pass
+TRADOVATE_APP_ID=tradeify-bot
+TRADOVATE_APP_VERSION=1.0.0
+TRADOVATE_CLIENT_ID=your-client-id
+TRADOVATE_CLIENT_SECRET=your-client-secret
+TRADOVATE_DEMO=true
+TRADOVATE_BASE_URL=https://demo.tradovateapi.com/v1
+TRADOVATE_WS_URL=wss://demo.tradovateapi.com/v1/websocket
+```
+
+Smoke-test the wiring without sending orders:
+
+```bash
+python -m app.main --workflow premarket            # DRY_RUN by default
+python -m app.main --workflow run-day              # full DRY_RUN sequence
+```
+
+Run with the Tradovate demo adapter (still simulation, never live):
+
+```bash
+WORKFLOW_EXECUTION_MODE=PAPER \
+AUTONOMOUS_TRADING_ENABLED=true \
+BROKER_PROVIDER=tradovate \
+python -m app.main --workflow market-open --no-workflow-dry-run
+```
+
+Supported symbols (rejected otherwise): `MES, MNQ, ES, NQ, MGC, MCL,
+MYM, M2K`. Limit orders are preferred — `place_market_order` is
+allowed only when `DEFAULT_ORDER_TYPE=market`.
+
+Every order method returns a structured `OrderResult` (JSON-safe via
+`to_payload()`). Credentials are never logged: outgoing request
+bodies pass through `redact_secrets` first.
+
+> **Warnings**
+> - Demo / simulation only. There is no live execution path.
+> - TradingView is **optional** for charting, manual monitoring, and
+>   external alert ideas. **Automated execution does not go through
+>   TradingView.** Webhook signals (if configured) still pass model,
+>   risk, and broker validation, and only place demo orders.
+> - Setting `TRADOVATE_DEMO=false` or pointing `TRADOVATE_BASE_URL`
+>   away from `demo.tradovateapi.com` raises
+>   `TradovateConfigurationError` at construction.
+
 ### TradingView webhook (optional input)
 
 Webhooks are an *additional* signal source — the bot's primary
