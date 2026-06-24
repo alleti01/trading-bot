@@ -455,6 +455,224 @@ bodies pass through `redact_secrets` first.
 >   away from `demo.tradovateapi.com` raises
 >   `TradovateConfigurationError` at construction.
 
+### Workflow signal engine (real strategy + model)
+
+The autonomous workflow no longer assumes a direction. `market-open`
+runs the **real VWAP/EMA strategy** (and an optional model gate) per
+symbol via `workflows/signal_engine.py`:
+
+```
+market-open(symbol)
+  → load data/historical/<SYM>/1m.csv
+  → build canonical features
+  → VWAPEMAPullback.detect_setups (latest bar)
+  → optional model gate (WORKFLOW_MODEL_NAME)
+  → WorkflowSignal(direction, entry, stop, target, confidence) OR skip
+```
+
+- No setup / no data / model rejection → the symbol is **skipped**
+  (never a forced long).
+- `WORKFLOW_MODEL_NAME` (optional) gates entries with a trained model;
+  leave empty for strategy-only mode.
+- The resulting direction/stop/target flow into the equity bracket
+  order or the options layer.
+
+### Continuous intraday loop (autonomous paper)
+
+The intraday scanner is the genuinely autonomous mode. It re-scans the
+universe every `WORKFLOW_SCAN_INTERVAL_MINUTES` during the trading
+window and places bracket orders on approved setups:
+
+```bash
+# Dry run (real signals, no orders) — safe to leave running
+python -m app.main --workflow-intraday
+
+# Live paper (places Alpaca paper bracket orders on approved setups)
+python -m app.main --workflow-intraday --no-workflow-dry-run
+```
+
+Per cycle, for each symbol: refresh bars → `SignalEngine` → long-only
+filter → risk caps → bracket order → Discord alert. Outside the trading
+window it sleeps without scanning. LIVE is refused; DRY_RUN never orders.
+
+#### Dynamic universe (research-agent watchlist, allowlist-gated)
+
+By default the loop scans `ENABLED_SYMBOLS`. Set
+`WORKFLOW_DYNAMIC_UNIVERSE=true` to expand the scan set using a **vetted
+liquid allowlist** (`config/equity_allowlist.py`):
+
+```ini
+WORKFLOW_DYNAMIC_UNIVERSE=true
+WORKFLOW_MAX_UNIVERSE=15
+WORKFLOW_AGENT_WATCHLIST=true   # let research agents rank allowlist names
+WORKFLOW_LONG_ONLY=true
+WORKFLOW_SCAN_INTERVAL_MINUTES=5
+```
+
+Safety model (unchanged guarantee): research agents may only **rank
+allowlist names** to prioritize the scan — they can never invent a
+ticker and never decide a trade. Every symbol (pinned or discovered)
+still passes the deterministic gate: data → VWAP/EMA setup → model →
+risk → broker validation. `ENABLED_SYMBOLS` are always scanned first;
+the cap bounds total symbols per cycle.
+
+### Live data ingestion (Alpaca bars)
+
+Download real 1-minute bars into the repo convention
+(`data/historical/<SYM>/1m.csv`) so signals run on real data:
+
+```bash
+# ENABLED_SYMBOLS, last 30 days
+python -m app.main --download-data
+
+# Specific symbols / window
+python -m app.main --download-data --download-symbols SPY,QQQ,AAPL --download-days 60
+```
+
+Read-only market data (`data/alpaca_bars.py`) — never places orders.
+Uses the same paper keys but only the data endpoints. One symbol
+failing does not abort the others.
+
+### Multi-asset support (futures, equities, options)
+
+The VWAP/EMA strategy is instrument-agnostic — it only needs OHLCV bars.
+The bot now supports three asset classes:
+
+| Asset    | Symbols (examples)        | Fills model        | Broker |
+|----------|---------------------------|--------------------|--------|
+| Futures  | MES, MNQ, MGC, MCL…       | `FuturesFillsModel` | Tradovate demo / mock |
+| Equities | SPY, QQQ, AAPL, MSFT…     | `EquityFillsModel`  | Alpaca paper / mock |
+| Options  | (on the equity underlying) | premium-based      | Alpaca paper / mock |
+
+Equities use penny ticks + per-share commission (Alpaca paper is
+commission-free). Any equity ticker can be registered on demand via
+`config.instruments.register_equity`.
+
+### Options trading layer (paper / simulation only)
+
+Options sit on top of the underlying's VWAP/EMA signal — a long signal
+on SPY becomes a call (or bull call spread), a short signal becomes a
+put (or bear put spread). There is **no live path**.
+
+```
+VWAP/EMA signal (SPY long)
+  → selection (ATM call / vertical / iron condor)
+  → options risk gate (premium cap, DTE, max positions)
+  → execution (Alpaca paper or mock)
+  → position manager (greeks, profit target, expiry auto-close, rolling)
+  → Discord alert (underlying + strategy + reason)
+```
+
+The `options/` package:
+
+| Module | Role |
+|--------|------|
+| `contract.py` | `OptionContract` + OCC symbol encode/decode |
+| `greeks.py` | Black-Scholes greeks (pure Python, no SciPy) |
+| `chain.py` | `SyntheticChainProvider` (tests/backtest) + `AlpacaChainProvider` |
+| `selection.py` | ATM directional, vertical spread, iron condor selection |
+| `risk_rules.py` | Deterministic entry gate (premium / DTE / open positions) |
+| `execution.py` | `MockOptionsExecutor` + `AlpacaOptionsExecutor` (single + multi-leg) |
+| `position_manager.py` | Tracks positions, greeks, profit/stop, expiry, rolling |
+| `trader.py` | `OptionsTrader` — wires signal → selection → risk → execution |
+
+`.env`:
+
+```ini
+OPTIONS_ENABLED=true
+OPTIONS_STRATEGY=atm_directional      # or vertical_spread / iron_condor
+OPTIONS_ENABLED_UNDERLYINGS=SPY,QQQ,AAPL,MSFT
+OPTIONS_DEFAULT_DTE=30
+OPTIONS_MAX_PREMIUM_PER_TRADE=500
+OPTIONS_MAX_OPEN_POSITIONS=5
+OPTIONS_AUTO_CLOSE_DTE=5
+OPTIONS_AUTO_ROLL=true
+OPTIONS_PROFIT_TARGET_PCT=50
+OPTIONS_STOP_LOSS_PCT=-50
+```
+
+> **Demo / simulation only.** Options execution runs against Alpaca's
+> paper endpoints or the in-memory mock. The position manager
+> auto-closes near expiry, takes profit / stops out by percentage, and
+> can roll positions forward. All advisory + paper — no live execution.
+
+#### How options wire into the workflow
+
+When `OPTIONS_ENABLED=true`, the market-open workflow routes a
+directional signal on an allowed underlying (`OPTIONS_ENABLED_UNDERLYINGS`)
+into the options layer instead of buying shares:
+
+```
+market-open: SPY long signal
+  → workflows/options_execution.execute_options_signal
+  → OptionsTrader.handle_signal (selection → risk → execution)
+midday: OptionsTrader.manage() → profit/stop/expiry/roll
+```
+
+DRY_RUN never routes to options (it short-circuits to a simulated
+hold). Symbols not listed in `OPTIONS_ENABLED_UNDERLYINGS` fall through
+to the normal equity/broker path.
+
+### Equity bracket orders (Alpaca)
+
+Equity entries use a **native Alpaca bracket order** — the entry limit
+plus an attached `stop_loss` (and a synthesized `take_profit` when none
+is supplied) are submitted as one `order_class=bracket` request.
+
+This replaced the earlier "entry then a separate stop" flow, which
+Alpaca rejected with `403 Forbidden` because the protective stop was
+sent before the entry filled. With a bracket order Alpaca arms the
+protective legs automatically once the entry fills.
+
+- `BaseBroker.place_bracket_order(...)` — default falls back to a plain
+  limit entry for adapters without native brackets (e.g. Tradovate).
+- `AlpacaPaperClient.place_bracket_order(...)` — native bracket payload.
+- `MockBroker.place_bracket_order(...)` — simulated fill carrying the
+  protective legs in `raw`.
+
+The workflow calls this via
+`workflows/order_execution.execute_entry_with_stops(...)`.
+
+### Parallel paper evaluation
+
+Run Alpaca paper and futures local simulation side-by-side as
+independent evaluation tracks. They share **nothing**: no broker state,
+no open positions, no trade IDs, no state files.
+
+| Track         | Purpose                          | Symbols           | Broker      |
+|---------------|----------------------------------|-------------------|-------------|
+| `alpaca`      | Test broker/API plumbing         | SPY, QQQ, AAPL… | Alpaca Paper |
+| `futures_sim` | Test futures strategy/model      | MES, MNQ, MGC… | Local MockBroker |
+
+```ini
+ENABLE_PARALLEL_PAPER=true
+PARALLEL_BROKERS=futures_sim,alpaca
+ALPACA_ENABLED_SYMBOLS=SPY,QQQ,AAPL,MSFT
+FUTURES_SIM_ENABLED_SYMBOLS=MES,MNQ,MGC,MCL
+ALPACA_EVALUATION_ID=alpaca_2week_test
+FUTURES_SIM_EVALUATION_ID=futures_sim_2week_test
+```
+
+```bash
+# Launch both tracks
+python -m app.main --start-parallel-paper --no-workflow-dry-run
+
+# Check status
+python -m app.main --parallel-paper-status
+
+# Generate reports
+python -m app.main --parallel-paper-report
+```
+
+Reports land in `data/evaluations/<evaluation_id>/` per track plus
+a `data/evaluations/parallel_summary.md` combined overview. The
+summary states explicitly:
+
+> Alpaca tests broker/API plumbing. futures_sim tests futures
+> strategy/model behavior. Do not compare PnL directly across them.
+
+Every Discord alert includes `broker_provider` + `evaluation_id`.
+
 ### TradingView webhook (optional input)
 
 Webhooks are an *additional* signal source — the bot's primary

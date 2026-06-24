@@ -30,7 +30,21 @@ _DEFAULT_QUOTES: dict[str, float] = {
     "MCL": 78.50,
     "MYM": 38500.00,
     "M2K": 2050.00,
+    # Equities / ETFs
+    "SPY": 550.00,
+    "QQQ": 480.00,
+    "AAPL": 210.00,
+    "MSFT": 440.00,
+    "IWM": 220.00,
+    "NVDA": 130.00,
+    "TSLA": 250.00,
+    "AMD": 160.00,
 }
+
+# Fallback price for an enabled symbol with no seeded quote, so the
+# mock broker can service equities/options it wasn't explicitly told
+# about without raising.
+_FALLBACK_QUOTE = 100.0
 
 
 class MockBroker(BaseBroker):
@@ -72,7 +86,13 @@ class MockBroker(BaseBroker):
         sym = symbol.upper()
         last = self._quotes.get(sym)
         if last is None:
-            raise KeyError(f"No mock quote for symbol {sym!r}")
+            # Mint a synthetic quote for any enabled symbol the mock
+            # wasn't seeded with (equities/options the futures registry
+            # doesn't know about). Unknown + not enabled → raise.
+            if sym in self.enabled_symbols:
+                last = _FALLBACK_QUOTE
+            else:
+                raise KeyError(f"No mock quote for symbol {sym!r}")
         return Quote(
             symbol=sym,
             bid=last - 0.25,
@@ -87,8 +107,9 @@ class MockBroker(BaseBroker):
         sym = symbol.upper()
         if qty <= 0:
             return ValidationResult(valid=False, reason="qty must be > 0")
-        if sym not in SUPPORTED_SYMBOLS:
-            return ValidationResult(valid=False, reason=f"unsupported symbol {sym}")
+        # The mock broker is asset-class-agnostic: it services any symbol
+        # the operator enabled (futures, equities, options). The futures
+        # SUPPORTED_SYMBOLS set is no longer a hard gate here.
         if sym not in self.enabled_symbols:
             return ValidationResult(valid=False, reason=f"symbol {sym} not enabled")
         try:
@@ -152,6 +173,37 @@ class MockBroker(BaseBroker):
             time_in_force=time_in_force,
             fill=False,
         )
+
+    def place_bracket_order(
+        self,
+        *,
+        symbol: str,
+        qty: float,
+        side: OrderSide,
+        entry_price: float,
+        stop_price: float,
+        target_price: Optional[float] = None,
+        time_in_force: TimeInForce = "day",
+    ) -> OrderResult:
+        # Simulate a filled bracket entry; carry the protective legs in raw.
+        result = self._record_order(
+            symbol=symbol,
+            qty=qty,
+            side=side,
+            order_type="limit",
+            limit_price=entry_price,
+            stop_price=stop_price,
+            time_in_force=time_in_force,
+            fill=True,
+        )
+        result.raw.update(
+            {
+                "order_class": "bracket",
+                "take_profit": target_price,
+                "stop_loss": stop_price,
+            }
+        )
+        return result
 
     def place_trailing_stop(
         self,

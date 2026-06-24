@@ -394,6 +394,64 @@ class AlpacaPaperClient(BaseBroker):
         result.raw.update({"trail": trail, "trail_kind": "percent"})
         return result
 
+    def place_bracket_order(
+        self,
+        *,
+        symbol: str,
+        qty: float,
+        side: OrderSide,
+        entry_price: float,
+        stop_price: float,
+        target_price: Optional[float] = None,
+        time_in_force: TimeInForce = "day",
+    ) -> OrderResult:
+        """Native Alpaca bracket order: entry + stop_loss (+ optional take_profit).
+
+        Alpaca rejects a free-standing protective stop placed immediately
+        after a still-unfilled entry (the 403 we saw). A ``bracket`` order
+        class attaches the protective legs so the broker arms them once
+        the entry fills.
+        """
+        self._refuse_if_futures(symbol)
+        # A bracket order requires a take-profit leg; synthesize one from a
+        # symmetric risk:reward if the caller didn't supply a target.
+        if target_price is None:
+            risk = abs(entry_price - stop_price)
+            target_price = (
+                entry_price + 2 * risk if side == "buy" else entry_price - 2 * risk
+            )
+        body: dict[str, Any] = {
+            "symbol": symbol.upper(),
+            "qty": float(qty),
+            "side": side,
+            "type": "limit",
+            "limit_price": float(entry_price),
+            "time_in_force": time_in_force,
+            "order_class": "bracket",
+            "take_profit": {"limit_price": round(float(target_price), 2)},
+            "stop_loss": {"stop_price": round(float(stop_price), 2)},
+        }
+        resp = self._post("/v2/orders", body=body)
+        raw = dict(resp) if isinstance(resp, dict) else {}
+        raw.setdefault("order_class", "bracket")
+        raw["take_profit"] = body["take_profit"]
+        raw["stop_loss"] = body["stop_loss"]
+        return OrderResult(
+            success="id" in resp if isinstance(resp, dict) else False,
+            simulated=True,
+            order_id=str(resp.get("id", uuid.uuid4().hex)) if isinstance(resp, dict) else uuid.uuid4().hex,
+            symbol=symbol.upper(),
+            side=side,
+            quantity=float(qty),
+            order_type="limit",
+            status=_map_status(resp.get("status", "accepted")) if isinstance(resp, dict) else "accepted",
+            time_in_force=time_in_force,
+            limit_price=float(entry_price),
+            stop_price=float(stop_price),
+            reason=resp.get("reject_reason") if isinstance(resp, dict) else None,
+            raw=raw,
+        )
+
     def close_position(self, *, symbol: str) -> OrderResult:
         self._refuse_if_futures(symbol)
         sym = symbol.upper()

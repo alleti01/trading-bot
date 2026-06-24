@@ -23,13 +23,17 @@ from typing import Iterable, Optional
 @dataclass(frozen=True)
 class InstrumentSpec:
     symbol: str
-    market_type: str          # "futures" | "crypto"
+    market_type: str          # "futures" | "crypto" | "equity" | "option"
     tick_size: float          # smallest price increment
     tick_value: float         # $ value per tick per contract / unit
     point_value: float        # $ value per 1.00 price move
     session_tz: str           # timezone for trading session
     session_open: str         # HH:MM
     session_close: str        # HH:MM
+    # For options: the underlying equity symbol (e.g. "SPY"). None for
+    # everything else. Lets the chain/selection layer map an option
+    # contract back to the instrument the strategy actually signals on.
+    underlying: Optional[str] = None
 
 
 # Built-in registry. CME micro futures (RTH 09:30–16:00 ET) + a crypto
@@ -83,7 +87,81 @@ _REGISTRY: dict[str, InstrumentSpec] = {
         session_tz="UTC",
         session_open="00:00", session_close="23:59",
     ),
+    # ---- US equities / ETFs (RTH 09:30–16:00 ET) ----------------------
+    # Penny tick, $1 per point per share. These are the liquid names the
+    # VWAP/EMA strategy + options layer trade on Alpaca paper.
+    "SPY": InstrumentSpec(
+        symbol="SPY", market_type="equity",
+        tick_size=0.01, tick_value=0.01, point_value=1.0,
+        session_tz="America/New_York",
+        session_open="09:30", session_close="16:00",
+    ),
+    "QQQ": InstrumentSpec(
+        symbol="QQQ", market_type="equity",
+        tick_size=0.01, tick_value=0.01, point_value=1.0,
+        session_tz="America/New_York",
+        session_open="09:30", session_close="16:00",
+    ),
+    "AAPL": InstrumentSpec(
+        symbol="AAPL", market_type="equity",
+        tick_size=0.01, tick_value=0.01, point_value=1.0,
+        session_tz="America/New_York",
+        session_open="09:30", session_close="16:00",
+    ),
+    "MSFT": InstrumentSpec(
+        symbol="MSFT", market_type="equity",
+        tick_size=0.01, tick_value=0.01, point_value=1.0,
+        session_tz="America/New_York",
+        session_open="09:30", session_close="16:00",
+    ),
+    "IWM": InstrumentSpec(
+        symbol="IWM", market_type="equity",
+        tick_size=0.01, tick_value=0.01, point_value=1.0,
+        session_tz="America/New_York",
+        session_open="09:30", session_close="16:00",
+    ),
+    "NVDA": InstrumentSpec(
+        symbol="NVDA", market_type="equity",
+        tick_size=0.01, tick_value=0.01, point_value=1.0,
+        session_tz="America/New_York",
+        session_open="09:30", session_close="16:00",
+    ),
+    "TSLA": InstrumentSpec(
+        symbol="TSLA", market_type="equity",
+        tick_size=0.01, tick_value=0.01, point_value=1.0,
+        session_tz="America/New_York",
+        session_open="09:30", session_close="16:00",
+    ),
+    "AMD": InstrumentSpec(
+        symbol="AMD", market_type="equity",
+        tick_size=0.01, tick_value=0.01, point_value=1.0,
+        session_tz="America/New_York",
+        session_open="09:30", session_close="16:00",
+    ),
 }
+
+
+# Equity symbols that may be registered on demand. Stocks share one spec
+# shape (penny tick, $1/point), so the registry can mint a spec for any
+# ticker the operator enables without hardcoding all of them.
+def register_equity(symbol: str) -> "InstrumentSpec":
+    """Register (or return) an equity InstrumentSpec for ``symbol``.
+
+    Equities all share the same contract shape, so any uppercase ticker
+    can be minted on demand instead of being hardcoded above.
+    """
+    sym = symbol.upper()
+    existing = _REGISTRY.get(sym)
+    if existing is not None:
+        return existing
+    spec = InstrumentSpec(
+        symbol=sym, market_type="equity",
+        tick_size=0.01, tick_value=0.01, point_value=1.0,
+        session_tz="America/New_York",
+        session_open="09:30", session_close="16:00",
+    )
+    _REGISTRY[sym] = spec
+    return spec
 
 
 def get_instrument(symbol: str) -> InstrumentSpec:

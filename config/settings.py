@@ -22,7 +22,7 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 Mode = Literal["BACKTEST", "TRAIN", "PAPER", "LIVE"]
-MarketType = Literal["futures", "crypto"]
+MarketType = Literal["futures", "crypto", "equity", "option"]
 WorkflowExecutionMode = Literal["DRY_RUN", "PAPER", "LIVE"]
 BrokerProvider = Literal["mock", "alpaca", "tradovate"]
 DefaultOrderType = Literal["limit", "market"]
@@ -216,6 +216,34 @@ class Settings(BaseSettings):
     AUTONOMOUS_PAPER_ONLY: bool = True
     # Memory directory for strategy/research/trade logs.
     WORKFLOW_MEMORY_DIR: Path = Path("./memory")
+    # Optional model that gates workflow entries. When set, the signal
+    # engine scores each strategy setup with this model and only trades
+    # approved setups. When unset, the workflow trades raw strategy
+    # signals (strategy-only mode).
+    WORKFLOW_MODEL_NAME: Optional[str] = None
+    WORKFLOW_MODEL_VERSION: str = "latest"
+    # When true, a symbol with no usable OHLCV data / no setup is skipped
+    # (safe). This is always the behavior; the flag documents intent.
+    WORKFLOW_REQUIRE_SIGNAL: bool = True
+
+    # ---- Continuous intraday loop + dynamic universe -------------------
+    # The intraday loop re-scans the universe every N minutes during the
+    # trading window and places bracket orders on approved setups.
+    WORKFLOW_SCAN_INTERVAL_MINUTES: int = Field(default=5, ge=1, le=60)
+    # When true, the loop refreshes bars from Alpaca before each scan.
+    WORKFLOW_REFRESH_DATA_EACH_SCAN: bool = True
+    # Long-only ignores short setups (avoids short-borrow complications).
+    WORKFLOW_LONG_ONLY: bool = True
+    # Dynamic universe: expand the scan set beyond ENABLED_SYMBOLS using
+    # the vetted liquid allowlist (and optional research-agent ranking).
+    # The LLM can only prioritize allowlist names — never invent tickers.
+    WORKFLOW_DYNAMIC_UNIVERSE: bool = False
+    # Hard cap on how many symbols the loop scans per cycle.
+    WORKFLOW_MAX_UNIVERSE: int = Field(default=15, ge=1, le=100)
+    # When true, the research agent (if enabled) proposes which allowlist
+    # names to prioritize today. Falls back to deterministic allowlist
+    # order when agents are off.
+    WORKFLOW_AGENT_WATCHLIST: bool = False
 
     # ---- Broker adapter (paper/demo only) ------------------------------
     # ``BROKER_PROVIDER`` selects the integration used by the workflow
@@ -251,6 +279,44 @@ class Settings(BaseSettings):
     ALPACA_SECRET_KEY: Optional[SecretStr] = None
     ALPACA_PAPER: bool = True
     ALPACA_BASE_URL: str = "https://paper-api.alpaca.markets"
+
+    # ---- Options trading (paper/simulation only) ----------------------
+    # Directional/spread/condor options on top of the VWAP/EMA signal on
+    # the underlying. Execution is Alpaca paper or mock only — never live.
+    OPTIONS_ENABLED: bool = False
+    # atm_directional | vertical_spread | iron_condor
+    OPTIONS_STRATEGY: str = "atm_directional"
+    OPTIONS_DEFAULT_DTE: int = Field(default=30, ge=0)
+    OPTIONS_MIN_DTE: int = Field(default=7, ge=0)
+    OPTIONS_MAX_DTE: int = Field(default=60, ge=1)
+    OPTIONS_TARGET_DELTA: float = Field(default=0.50, gt=0.0, le=1.0)
+    OPTIONS_SPREAD_WIDTH_STRIKES: int = Field(default=1, ge=1)
+    OPTIONS_MAX_PREMIUM_PER_TRADE: float = Field(default=500.0, ge=0.0)
+    OPTIONS_MAX_OPEN_POSITIONS: int = Field(default=5, ge=1)
+    OPTIONS_AUTO_CLOSE_DTE: int = Field(default=5, ge=0)
+    OPTIONS_AUTO_ROLL: bool = True
+    OPTIONS_ROLL_DTE_TRIGGER: int = Field(default=7, ge=0)
+    OPTIONS_PROFIT_TARGET_PCT: float = 50.0
+    OPTIONS_STOP_LOSS_PCT: float = -50.0
+    OPTIONS_QTY_PER_TRADE: int = Field(default=1, ge=1)
+    OPTIONS_STATE_PATH: str = "data/options/positions.json"
+    # Underlyings the options layer is allowed to trade.
+    OPTIONS_ENABLED_UNDERLYINGS: str = "SPY,QQQ,AAPL,MSFT"
+
+    # ---- Parallel paper evaluation -------------------------------------
+    # When ``ENABLE_PARALLEL_PAPER=true`` and ``--start-parallel-paper``
+    # is passed on the CLI, the runner launches one evaluation track per
+    # entry in ``PARALLEL_BROKERS``. Each track gets its own broker,
+    # symbol universe, state file, and report directory. Brokers do NOT
+    # share positions or trade state.
+    ENABLE_PARALLEL_PAPER: bool = False
+    PARALLEL_BROKERS: str = "futures_sim,alpaca"
+    ALPACA_ENABLED_SYMBOLS: str = "SPY,QQQ,AAPL,MSFT"
+    FUTURES_SIM_ENABLED_SYMBOLS: str = "MES,MNQ,MGC,MCL"
+    ALPACA_EVALUATION_ID: str = "alpaca_2week_test"
+    FUTURES_SIM_EVALUATION_ID: str = "futures_sim_2week_test"
+    ALPACA_STATE_PATH: str = "data/paper/alpaca_state.json"
+    FUTURES_SIM_STATE_PATH: str = "data/paper/futures_sim_state.json"
 
     # ---- Notifications -------------------------------------------------
     DISCORD_WEBHOOK_URL: Optional[SecretStr] = None
@@ -340,6 +406,17 @@ class Settings(BaseSettings):
         if s not in {"limit", "market"}:
             raise ValueError(
                 f"Invalid DEFAULT_ORDER_TYPE '{v}'. Allowed: ['limit', 'market']."
+            )
+        return s
+
+    @field_validator("OPTIONS_STRATEGY", mode="before")
+    @classmethod
+    def _normalize_options_strategy(cls, v: object) -> str:
+        s = str(v or "atm_directional").strip().lower()
+        allowed = {"atm_directional", "vertical_spread", "iron_condor"}
+        if s not in allowed:
+            raise ValueError(
+                f"Invalid OPTIONS_STRATEGY '{v}'. Allowed: {sorted(allowed)}."
             )
         return s
 

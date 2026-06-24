@@ -67,35 +67,28 @@ def test_market_open_uses_integration_broker_for_entry(
     mock_broker = MagicMock(spec=MockBroker)
     mock_broker.reconcile.return_value = {"open_positions": 0, "open_orders": 0}
     mock_broker.validate_order.return_value = MagicMock(valid=True, quote=None)
-    mock_broker.place_limit_order.return_value = OrderResult(
+    # The workflow now places a single native bracket order (entry +
+    # attached protective stop/target) instead of separate legs.
+    mock_broker.place_bracket_order.return_value = OrderResult(
         success=True,
         simulated=True,
-        order_id="e1",
+        order_id="br1",
         symbol="MES",
         side="buy",
         quantity=1.0,
         order_type="limit",
         status="working",
-    )
-    mock_broker.place_stop_order.return_value = OrderResult(
-        success=True,
-        simulated=True,
-        order_id="s1",
-        symbol="MES",
-        side="sell",
-        quantity=1.0,
-        order_type="stop",
-        status="working",
         stop_price=4990.0,
     )
 
+    from tests._signal_stub import stub_market_open_signal
+
     with patch(
         "workflows.workflow_runner.build_broker", return_value=mock_broker
-    ):
+    ), stub_market_open_signal(price=5000.0):
         result = runner.run("market-open", now=now)
 
     assert result.success
     assert result.payload.get("actions_taken", 0) >= 1
     mock_broker.reconcile.assert_called()
-    mock_broker.place_limit_order.assert_called()
-    mock_broker.place_stop_order.assert_called()
+    mock_broker.place_bracket_order.assert_called()

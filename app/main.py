@@ -242,6 +242,22 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--workflow-intraday",
+        action="store_true",
+        help=(
+            "Start the continuous intraday scanner: re-scans the universe "
+            "every WORKFLOW_SCAN_INTERVAL_MINUTES during the trading window "
+            "and places bracket orders on approved setups. Blocks until "
+            "interrupted. Honors --workflow-dry-run."
+        ),
+    )
+    parser.add_argument(
+        "--intraday-max-cycles",
+        type=int,
+        default=None,
+        help="Bound the intraday loop to N cycles (testing/one-shot).",
+    )
+    parser.add_argument(
         "--workflow-dry-run",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -256,6 +272,45 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--workflow-force",
         action="store_true",
         help="Force workflow to run (e.g. weekly-review on non-Friday).",
+    )
+    parser.add_argument(
+        "--download-data",
+        action="store_true",
+        help=(
+            "Download historical 1m bars from Alpaca for ENABLED_SYMBOLS "
+            "(or --download-symbols) into data/historical/<SYM>/1m.csv. "
+            "Read-only market data; never places orders."
+        ),
+    )
+    parser.add_argument(
+        "--download-symbols",
+        type=str,
+        default=None,
+        help="Comma-separated symbols for --download-data (default: ENABLED_SYMBOLS).",
+    )
+    parser.add_argument(
+        "--download-days",
+        type=int,
+        default=30,
+        help="Lookback window in days for --download-data (default 30).",
+    )
+    parser.add_argument(
+        "--start-parallel-paper",
+        action="store_true",
+        help=(
+            "Launch parallel paper evaluation tracks (one per PARALLEL_BROKERS entry). "
+            "Requires ENABLE_PARALLEL_PAPER=true."
+        ),
+    )
+    parser.add_argument(
+        "--parallel-paper-status",
+        action="store_true",
+        help="Print the status of each parallel paper evaluation track.",
+    )
+    parser.add_argument(
+        "--parallel-paper-report",
+        action="store_true",
+        help="Generate per-track and combined parallel paper evaluation reports.",
     )
     return parser.parse_args(argv)
 
@@ -1785,6 +1840,67 @@ def _run_promote_model(settings: Settings, log, *, args) -> int:
     return 0
 
 
+def _run_download_data(settings: Settings, log, *, args: argparse.Namespace) -> int:
+    """Download historical bars from Alpaca into the historical data dir."""
+    from data.alpaca_bars import download_symbols
+
+    symbols = None
+    if args.download_symbols:
+        symbols = [s.strip().upper() for s in args.download_symbols.split(",") if s.strip()]
+
+    try:
+        results = download_symbols(
+            settings,
+            symbols=symbols,
+            timeframe="1m",
+            days=int(args.download_days),
+        )
+    except Exception as e:  # noqa: BLE001
+        log.error("download.failed", error=str(e))
+        return 5
+
+    ok = [s for s, r in results.items() if r == "ok"]
+    failed = {s: r for s, r in results.items() if r != "ok"}
+    log.info("download.complete", ok=ok, failed=failed)
+    return 0 if ok else 5
+
+
+def _run_intraday_cli(settings: Settings, log, *, args: argparse.Namespace) -> int:
+    """Run the continuous intraday scanner (autonomous paper loop)."""
+    from agents.orchestrator import build_orchestrator
+    from notifications.notification_service import NotificationService
+    from workflows.intraday_loop import IntradayLoop
+
+    if settings.WORKFLOW_EXECUTION_MODE == "LIVE":
+        log.error("intraday.live_refused", note="LIVE is locked.")
+        return 6
+
+    notifier = NotificationService.from_settings(settings)
+    orchestrator = None
+    if settings.ENABLE_LLM_AGENTS:
+        try:
+            orchestrator = build_orchestrator(settings, notifier=notifier)
+        except Exception as e:  # noqa: BLE001
+            log.warning("intraday.orchestrator_unavailable", error=str(e))
+
+    loop = IntradayLoop(
+        settings,
+        notifier=notifier,
+        orchestrator=orchestrator,
+        dry_run=args.workflow_dry_run,
+    )
+    log.info(
+        "intraday.cli",
+        dry_run=loop.dry_run,
+        execution_mode=settings.WORKFLOW_EXECUTION_MODE,
+        interval_minutes=settings.WORKFLOW_SCAN_INTERVAL_MINUTES,
+        dynamic_universe=settings.WORKFLOW_DYNAMIC_UNIVERSE,
+        long_only=settings.WORKFLOW_LONG_ONLY,
+    )
+    loop.run_forever(max_cycles=args.intraday_max_cycles)
+    return 0
+
+
 def _run_workflow_cli(settings: Settings, log, *, args: argparse.Namespace) -> int:
     """Run autonomous workflows (separate from MODE train/backtest/paper loop)."""
     from workflows.scheduler import WorkflowScheduler
@@ -1833,6 +1949,69 @@ def _run_workflow_cli(settings: Settings, log, *, args: argparse.Namespace) -> i
         skipped=result.skipped,
         dry_run=result.dry_run,
     )
+    return 0
+
+
+def _run_parallel_paper_cli(settings: Settings, log, *, args: argparse.Namespace) -> int:
+    """Launch, query, or report on parallel paper evaluation tracks."""
+    import json
+
+    from evaluation.parallel_paper_runner import ParallelPaperRunner
+    from reports.paper_evaluation_report import write_combined_summary, write_track_report
+
+    if settings.WORKFLOW_EXECUTION_MODE == "LIVE":
+        log.error("parallel.live_refused", note="LIVE is locked.")
+        return 6
+
+    if not settings.ENABLE_PARALLEL_PAPER:
+        log.error(
+            "parallel.not_enabled",
+            note="Set ENABLE_PARALLEL_PAPER=true to use parallel paper mode.",
+        )
+        return 4
+
+    runner = ParallelPaperRunner(
+        settings,
+        dry_run=args.workflow_dry_run,
+    )
+    runner.build_tracks()
+
+    if args.parallel_paper_status:
+        status = runner.status()
+        print(json.dumps(status, indent=2, default=str))
+        return 0
+
+    if args.parallel_paper_report:
+        results: dict = {}
+        for provider, ctx in runner.contexts.items():
+            state = ctx.load_state()
+            results[provider] = {
+                "success": not ctx.blocked,
+                "trades": state.get("trade_count", 0),
+                "workflows": [],
+            }
+            write_track_report(ctx, payload=results[provider])
+        write_combined_summary(runner.contexts, results=results)
+        log.info("parallel.reports_written")
+        return 0
+
+    if args.start_parallel_paper:
+        log.info(
+            "parallel.start",
+            providers=sorted(runner.contexts.keys()),
+            dry_run=args.workflow_dry_run,
+        )
+        results = runner.run_all(force=bool(args.workflow_force))
+        for provider, ctx in runner.contexts.items():
+            payload = results.get(provider, {})
+            write_track_report(ctx, payload=payload)
+        write_combined_summary(runner.contexts, results=results)
+        all_ok = all(
+            r.get("success", False) for r in results.values() if isinstance(r, dict)
+        )
+        log.info("parallel.done", success=all_ok)
+        return 0 if all_ok else 5
+
     return 0
 
 
@@ -1899,8 +2078,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.promote_model:
         return _run_promote_model(settings, log, args=args)
 
+    if args.download_data:
+        return _run_download_data(settings, log, args=args)
+
+    if args.workflow_intraday:
+        return _run_intraday_cli(settings, log, args=args)
+
     if args.workflow or args.workflow_scheduler:
         return _run_workflow_cli(settings, log, args=args)
+
+    if args.start_parallel_paper or args.parallel_paper_status or args.parallel_paper_report:
+        return _run_parallel_paper_cli(settings, log, args=args)
 
     if settings.MODE == "TRAIN":
         return _run_train_from_csv(settings, log, args)

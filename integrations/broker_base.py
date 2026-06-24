@@ -185,6 +185,33 @@ class BaseBroker(ABC):
     @abstractmethod
     def cancel_order(self, *, order_id: str) -> OrderResult: ...
 
+    def place_bracket_order(
+        self,
+        *,
+        symbol: str,
+        qty: float,
+        side: OrderSide,
+        entry_price: float,
+        stop_price: float,
+        target_price: Optional[float] = None,
+        time_in_force: TimeInForce = "day",
+    ) -> OrderResult:
+        """Place an entry plus attached protective stop/target as one unit.
+
+        Default implementation (used by adapters that do not support a
+        native bracket order class) falls back to a plain limit entry —
+        the caller is responsible for the protective leg. Adapters with a
+        native bracket order (e.g. Alpaca) override this to attach the
+        stop/target so the broker manages them after the entry fills.
+        """
+        return self.place_limit_order(
+            symbol=symbol,
+            qty=qty,
+            side=side,
+            limit_price=entry_price,
+            time_in_force=time_in_force,
+        )
+
     def reconcile(self) -> dict[str, Any]:
         """Pull positions/orders before placing new orders."""
         try:

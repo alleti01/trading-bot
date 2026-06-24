@@ -96,7 +96,9 @@ class BrokerRouter:
     # ------------------------------------------------------------------
     # Per-provider builders
     # ------------------------------------------------------------------
-    def _build_alpaca(self, mode: str) -> BaseBroker:
+    def _build_alpaca(
+        self, mode: str, *, enabled_symbols_override: Optional[list[str]] = None
+    ) -> BaseBroker:
         api_key = (
             self.settings.ALPACA_API_KEY.get_secret_value()
             if self.settings.ALPACA_API_KEY
@@ -107,13 +109,14 @@ class BrokerRouter:
             if self.settings.ALPACA_SECRET_KEY
             else None
         )
+        symbols = enabled_symbols_override or list(self.settings.ENABLED_SYMBOLS)
         try:
             client = AlpacaPaperClient(
                 api_key=api_key,
                 secret_key=secret,
                 base_url=self.settings.ALPACA_BASE_URL,
                 paper=self.settings.ALPACA_PAPER,
-                enabled_symbols=list(self.settings.ENABLED_SYMBOLS),
+                enabled_symbols=symbols,
                 timeout_seconds=float(self.settings.BROKER_REQUEST_TIMEOUT_SECONDS),
             )
         except AlpacaConfigurationError as e:
@@ -131,7 +134,10 @@ class BrokerRouter:
         )
         return client
 
-    def _build_tradovate(self, mode: str) -> BaseBroker:
+    def _build_tradovate(
+        self, mode: str, *, enabled_symbols_override: Optional[list[str]] = None
+    ) -> BaseBroker:
+        symbols = enabled_symbols_override or list(self.settings.ENABLED_SYMBOLS)
         try:
             client = TradovateDemoClient(
                 base_url=self.settings.TRADOVATE_BASE_URL,
@@ -150,7 +156,7 @@ class BrokerRouter:
                     else None
                 ),
                 demo=self.settings.TRADOVATE_DEMO,
-                enabled_symbols=list(self.settings.ENABLED_SYMBOLS),
+                enabled_symbols=symbols,
                 timeout_seconds=float(self.settings.BROKER_REQUEST_TIMEOUT_SECONDS),
             )
         except TradovateConfigurationError as e:
@@ -179,10 +185,42 @@ def build_broker(
     return BrokerRouter(settings).for_execution_mode()
 
 
+def build_broker_for_provider(
+    settings: Settings,
+    *,
+    provider: str,
+    enabled_symbols: list[str],
+) -> BaseBroker:
+    """Build an isolated broker instance for a specific provider + symbol set.
+
+    Used by parallel paper mode so each evaluation track gets its own
+    broker without relying on the global ``BROKER_PROVIDER`` setting.
+    """
+    router = BrokerRouter(settings)
+    mode = router.execution_mode()
+    if mode == "LIVE":
+        raise LiveExecutionRefused(
+            "WORKFLOW_EXECUTION_MODE=LIVE is locked — no broker is built."
+        )
+    if mode == "DRY_RUN":
+        return MockBroker(enabled_symbols=enabled_symbols)
+
+    if provider == "mock" or provider == "futures_sim":
+        return MockBroker(enabled_symbols=enabled_symbols)
+    if provider == "alpaca":
+        return router._build_alpaca(mode, enabled_symbols_override=enabled_symbols)
+    if provider == "tradovate":
+        return router._build_tradovate(mode, enabled_symbols_override=enabled_symbols)
+    raise InvalidBrokerProviderError(
+        f"Unknown provider '{provider}' for parallel paper."
+    )
+
+
 __all__ = [
     "BrokerError",
     "BrokerRouter",
     "InvalidBrokerProviderError",
     "LiveExecutionRefused",
     "build_broker",
+    "build_broker_for_provider",
 ]

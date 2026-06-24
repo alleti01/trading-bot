@@ -22,6 +22,7 @@ from integrations.broker_router import (
     BrokerRouter,
     InvalidBrokerProviderError,
     build_broker,
+    build_broker_for_provider,
 )
 from integrations.mock_broker import MockBroker
 from integrations.tradovate_demo_client import (
@@ -50,4 +51,5 @@ __all__ = [
     "TradovateDemoClient",
     "ValidationResult",
     "build_broker",
+    "build_broker_for_provider",
 ]

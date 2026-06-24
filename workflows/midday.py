@@ -109,9 +109,22 @@ class MiddayWorkflow(BaseWorkflow):
 
             actions.append(action)
 
+        # Manage open options positions (profit target / stop / expiry / roll).
+        options_actions: list[dict[str, Any]] = []
+        if ctx.settings.OPTIONS_ENABLED and can_execute:
+            try:
+                from workflows.options_execution import build_options_trader
+
+                trader = build_options_trader(ctx, now=ctx.now)
+                if trader is not None:
+                    options_actions = trader.manage(now=ctx.now)
+            except Exception as e:  # noqa: BLE001
+                self.log.warning("workflow.options_manage_failed", error=str(e))
+
         return {
             "positions_checked": len(broker_state.positions),
             "actions": actions,
+            "options_actions": options_actions,
             "discord_sent": discord_sent,
             "dry_run": ctx.dry_run,
             "broker_provider": ctx.settings.BROKER_PROVIDER,

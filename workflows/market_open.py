@@ -16,8 +16,10 @@ from workflows.order_execution import (
     prepare_broker,
     resolve_order_broker,
 )
+from workflows.options_execution import execute_options_signal, options_enabled_for
 from workflows.premarket import PremarketWorkflow
 from workflows.schemas import SimulatedTradeDecision
+from workflows.signal_engine import SignalEngine
 
 
 class MarketOpenWorkflow(BaseWorkflow):
@@ -71,6 +73,12 @@ class MarketOpenWorkflow(BaseWorkflow):
         if autonomous and not ctx.dry_run and not use_integration:
             executor = build_paper_executor(ctx.settings)
 
+        signal_engine = SignalEngine(
+            ctx.settings,
+            model_name=ctx.settings.WORKFLOW_MODEL_NAME,
+            model_version=ctx.settings.WORKFLOW_MODEL_VERSION,
+        )
+
         for sym in ideas[: ctx.settings.MAX_ACTIVE_SYMBOLS]:
             price = quotes.get(sym.upper())
             if price is None:
@@ -106,15 +114,51 @@ class MarketOpenWorkflow(BaseWorkflow):
                 )
                 continue
 
-            spec = get_instrument(sym)
-            stop_ticks = ctx.settings.WEBHOOK_DEFAULT_STOP_TICKS
-            target_ticks = ctx.settings.WEBHOOK_DEFAULT_TARGET_TICKS
-            stop_dist = stop_ticks * spec.tick_size
-            target_dist = target_ticks * spec.tick_size
-            side = "long"
-            stop_price = price - stop_dist
-            target_price = price + target_dist
-            thesis = f"Planned idea from {ctx.session_date} research; revalidated at open."
+            # Real signal: run the VWAP/EMA strategy (+ optional model)
+            # instead of assuming a direction. No setup / no data / model
+            # rejection → skip the symbol.
+            signal = signal_engine.generate_signal(sym)
+            if signal is None:
+                decisions.append(
+                    SimulatedTradeDecision(
+                        symbol=sym,
+                        side="flat",
+                        decision="skip",
+                        reason="No strategy setup / no data for symbol",
+                    )
+                )
+                continue
+            if not signal.approved:
+                decisions.append(
+                    SimulatedTradeDecision(
+                        symbol=sym,
+                        side=signal.direction,
+                        decision="skip",
+                        entry_price=signal.entry_price,
+                        stop_price=signal.stop_price,
+                        target_price=signal.target_price,
+                        reason=f"Signal not approved ({signal.reason})",
+                    )
+                )
+                continue
+
+            side = signal.direction
+            entry_signal_price = signal.entry_price
+            stop_price = signal.stop_price
+            target_price = signal.target_price
+            # Use the live quote for execution pricing when available,
+            # else the strategy's entry price.
+            price = price or entry_signal_price
+            rr = abs(target_price - entry_signal_price) / max(
+                abs(entry_signal_price - stop_price), 1e-9
+            )
+            conf_txt = (
+                f" conf={signal.confidence:.2f}" if signal.confidence is not None else ""
+            )
+            thesis = (
+                f"{side} VWAP/EMA setup for {sym} on {ctx.session_date}"
+                f"{conf_txt} (reason={signal.reason})."
+            )
 
             if ctx.dry_run or not autonomous:
                 decisions.append(
@@ -126,7 +170,7 @@ class MarketOpenWorkflow(BaseWorkflow):
                         stop_price=stop_price,
                         target_price=target_price,
                         thesis=thesis,
-                        risk_reward=f"1:{target_ticks / max(stop_ticks, 1):.1f}",
+                        risk_reward=f"1:{rr:.1f}",
                         reason="DRY_RUN — simulated hold unless gates pass later",
                     )
                 )
@@ -145,6 +189,53 @@ class MarketOpenWorkflow(BaseWorkflow):
 
             qty = float(ctx.settings.MAX_POSITION_SIZE)
 
+            # Options routing: if enabled for this underlying, express the
+            # directional signal as an options trade instead of shares.
+            if options_enabled_for(ctx, sym):
+                opt_result = execute_options_signal(
+                    ctx,
+                    underlying=sym,
+                    direction=side,
+                    thesis=thesis,
+                    now=ctx.now,
+                )
+                status = opt_result.get("status")
+                if status == "opened":
+                    actions_taken += 1
+                    decisions.append(
+                        SimulatedTradeDecision(
+                            symbol=sym,
+                            side=side,
+                            decision="enter",
+                            entry_price=price,
+                            stop_price=stop_price,
+                            target_price=target_price,
+                            thesis=thesis,
+                            reason=f"Options entry ({ctx.settings.OPTIONS_STRATEGY})",
+                        )
+                    )
+                    discord_sent = self._notify_safe(
+                        ctx,
+                        "options.opened",
+                        instrument=sym,
+                        direction=side,
+                        strategy=ctx.settings.OPTIONS_STRATEGY,
+                        broker_provider=ctx.settings.BROKER_PROVIDER,
+                        source="workflow.market_open",
+                        thesis=thesis,
+                        detail=opt_result,
+                    ) or discord_sent
+                else:
+                    decisions.append(
+                        SimulatedTradeDecision(
+                            symbol=sym,
+                            side=side,
+                            decision="skip",
+                            reason=f"Options {status}: {opt_result.get('reason', '')}",
+                        )
+                    )
+                continue
+
             if use_integration:
                 ok, entry_res, stop_res = execute_entry_with_stops(
                     ctx,
@@ -153,6 +244,7 @@ class MarketOpenWorkflow(BaseWorkflow):
                     quantity=qty,
                     entry_price=price,
                     stop_price=stop_price,
+                    target_price=target_price,
                     thesis=thesis,
                 )
                 if ok:
@@ -166,7 +258,7 @@ class MarketOpenWorkflow(BaseWorkflow):
                             stop_price=stop_price,
                             target_price=target_price,
                             thesis=thesis,
-                            risk_reward=f"1:{target_ticks / max(stop_ticks, 1):.1f}",
+                            risk_reward=f"1:{rr:.1f}",
                             reason=(
                                 f"Broker entry ({ctx.settings.BROKER_PROVIDER}) "
                                 f"order={entry_res.order_id if entry_res else 'n/a'}"
@@ -220,7 +312,7 @@ class MarketOpenWorkflow(BaseWorkflow):
                         stop_price=stop_price,
                         target_price=target_price,
                         thesis=thesis,
-                        risk_reward=f"1:{target_ticks / max(stop_ticks, 1):.1f}",
+                        risk_reward=f"1:{rr:.1f}",
                         reason="Autonomous local paper entry",
                     )
                 )

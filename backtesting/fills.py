@@ -98,6 +98,66 @@ class FuturesFillsModel(FillsModel):
 
 
 # ---------------------------------------------------------------------------
+# Equity (stocks / ETFs)
+# ---------------------------------------------------------------------------
+class EquityFillsModel(FillsModel):
+    """Penny slippage + flat per-share commission for US equities.
+
+    Most retail equity brokers (incl. Alpaca paper) are commission-free,
+    so ``commission_per_share`` defaults to 0. Slippage is expressed in
+    cents (price increments) like the futures model uses ticks.
+    """
+
+    def __init__(
+        self,
+        instrument: InstrumentSpec | str,
+        *,
+        slippage_cents: float = 1.0,
+        commission_per_share: float = 0.0,
+    ) -> None:
+        self.spec = (
+            instrument if isinstance(instrument, InstrumentSpec) else get_instrument(instrument)
+        )
+        if self.spec.market_type != "equity":
+            raise ValueError(
+                f"EquityFillsModel got non-equity instrument {self.spec.symbol!r} "
+                f"(market_type={self.spec.market_type!r})"
+            )
+        if slippage_cents < 0:
+            raise ValueError("slippage_cents must be non-negative")
+        if commission_per_share < 0:
+            raise ValueError("commission_per_share must be non-negative")
+        self.slippage_cents = float(slippage_cents)
+        self.commission_per_share = float(commission_per_share)
+
+    def _slippage(self) -> float:
+        return self.slippage_cents * self.spec.tick_size
+
+    def _commission(self, quantity: float) -> float:
+        return self.commission_per_share * abs(float(quantity))
+
+    def entry(self, *, direction: str, raw_price: float, quantity: float) -> FillCosts:
+        s = self._slippage()
+        if direction == "long":
+            fill = raw_price + s
+        elif direction == "short":
+            fill = raw_price - s
+        else:
+            raise ValueError(f"Unknown direction {direction!r}")
+        return FillCosts(fill_price=fill, slippage=s, commission=self._commission(quantity))
+
+    def exit(self, *, direction: str, raw_price: float, quantity: float) -> FillCosts:
+        s = self._slippage()
+        if direction == "long":
+            fill = raw_price - s
+        elif direction == "short":
+            fill = raw_price + s
+        else:
+            raise ValueError(f"Unknown direction {direction!r}")
+        return FillCosts(fill_price=fill, slippage=s, commission=self._commission(quantity))
+
+
+# ---------------------------------------------------------------------------
 # Crypto
 # ---------------------------------------------------------------------------
 class CryptoFillsModel(FillsModel):
@@ -172,6 +232,15 @@ def make_fills_model(
             spec,
             slippage_ticks=slippage_ticks,
             commission_per_contract=commission_per_contract,
+        )
+
+    if spec.market_type == "equity":
+        # Equity: reuse the tick knob as cents of slippage, commission as
+        # per-share. Alpaca paper is commission-free so default is 0.
+        return EquityFillsModel(
+            spec,
+            slippage_cents=slippage_ticks if slippage_ticks > 0 else 1.0,
+            commission_per_share=commission_per_contract,
         )
 
     # Crypto path. Default to the model's safe defaults when not provided.

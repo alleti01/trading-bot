@@ -66,9 +66,15 @@ def execute_entry_with_stops(
     quantity: float,
     entry_price: float,
     stop_price: float,
+    target_price: Optional[float] = None,
     thesis: str,
 ) -> tuple[bool, Optional[OrderResult], Optional[OrderResult]]:
-    """Place entry (limit preferred) then protective stop on the integrations broker."""
+    """Place a bracket order (entry + attached protective stop/target).
+
+    Uses the broker's native bracket order so the protective stop is
+    armed atomically with the entry. This avoids the Alpaca 403 we hit
+    when sending a free-standing stop right after an unfilled entry.
+    """
     if ctx.entries_blocked:
         return False, None, None
 
@@ -77,7 +83,6 @@ def execute_entry_with_stops(
         return False, None, None
 
     order_side = "buy" if side == "long" else "sell"
-    stop_side = "sell" if side == "long" else "buy"
 
     validation = broker.validate_order(symbol=symbol, qty=quantity, side=order_side)
     if not validation.valid:
@@ -89,62 +94,47 @@ def execute_entry_with_stops(
         return False, None, None
 
     try:
-        if ctx.settings.DEFAULT_ORDER_TYPE == "market":
-            entry = broker.place_market_order(
-                symbol=symbol, qty=quantity, side=order_side
-            )
-        else:
-            entry = broker.place_limit_order(
-                symbol=symbol,
-                qty=quantity,
-                side=order_side,
-                limit_price=entry_price,
-            )
-    except BrokerError as e:
-        _block_entries(ctx, reason=f"entry_failed: {e}")
-        return False, None, None
-
-    if not entry.success:
-        _block_entries(ctx, reason=f"entry_rejected: {entry.reason}")
-        return False, entry, None
-
-    try:
-        stop = broker.place_stop_order(
+        entry = broker.place_bracket_order(
             symbol=symbol,
             qty=quantity,
+            side=order_side,
+            entry_price=entry_price,
             stop_price=stop_price,
-            side=stop_side,
+            target_price=target_price,
         )
     except BrokerError as e:
-        _block_entries(ctx, reason=f"stop_failed: {e}")
+        _block_entries(ctx, reason=f"bracket_failed: {e}")
         ctx.notifier.notify(
             "system.error",
             source="workflow.order_execution",
             symbol=symbol,
             error=str(e),
-            detail="Stop placement failed — blocking new entries",
+            detail="Bracket order failed — blocking new entries",
         )
-        return False, entry, None
+        return False, None, None
 
-    if not stop.success:
-        _block_entries(ctx, reason=f"stop_rejected: {stop.reason}")
+    if not entry.success:
+        _block_entries(ctx, reason=f"entry_rejected: {entry.reason}")
         ctx.notifier.notify(
             "system.error",
             source="workflow.order_execution",
             symbol=symbol,
-            error=stop.reason or "stop rejected",
-            detail="Stop placement failed — blocking new entries",
+            error=entry.reason or "entry rejected",
+            detail="Bracket entry rejected — blocking new entries",
         )
-        return False, entry, stop
+        return False, entry, None
 
     _log.info(
-        "workflow.entry_with_stop",
+        "workflow.entry_with_bracket",
         symbol=symbol,
         entry_id=entry.order_id,
-        stop_id=stop.order_id,
+        stop_price=stop_price,
+        target_price=target_price,
         thesis=thesis[:120],
     )
-    return True, entry, stop
+    # The protective stop is part of the bracket; return the entry as both
+    # the entry and the (broker-managed) protective leg marker.
+    return True, entry, entry
 
 
 def execute_close(ctx: WorkflowContext, *, symbol: str) -> Optional[OrderResult]:

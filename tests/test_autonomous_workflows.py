@@ -174,10 +174,13 @@ def test_paper_autonomous_can_submit_when_enabled(
         MAX_ACTIVE_SYMBOLS="1",
     )
     init_db()
+    from tests._signal_stub import stub_market_open_signal
+
     runner = WorkflowRunner.from_settings(settings, cli_dry_run=False)
     now = datetime(2026, 5, 19, 14, 30, tzinfo=timezone.utc)
     runner.run("premarket", now=now)
-    result = runner.run("market-open", now=now)
+    with stub_market_open_signal(price=5000.0):
+        result = runner.run("market-open", now=now)
     assert result.success
     assert result.payload.get("actions_taken", 0) >= 1
     assert "mock" in str(result.payload.get("broker_provider", ""))

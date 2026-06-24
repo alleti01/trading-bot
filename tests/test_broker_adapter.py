@@ -96,14 +96,16 @@ def test_router_is_live_locked(monkeypatch: pytest.MonkeyPatch) -> None:
     assert BrokerRouter(settings).is_live_locked() is True
 
 
-def test_validate_order_blocks_unsupported_symbol(
+def test_validate_order_blocks_symbol_not_in_enabled_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = _settings(monkeypatch)
+    # The mock broker is now asset-agnostic (futures/equity/option). A
+    # symbol that isn't in the enabled set is still blocked.
+    settings = _settings(monkeypatch)  # ENABLED_SYMBOLS=MES,MNQ
     broker = build_broker(settings)
     result = broker.validate_order(symbol="AAPL", qty=1, side="buy")
     assert not result.valid
-    assert "unsupported" in (result.reason or "").lower()
+    assert "not enabled" in (result.reason or "").lower()
 
 
 def test_validate_order_blocks_disabled_symbol(
@@ -116,15 +118,29 @@ def test_validate_order_blocks_disabled_symbol(
     assert "not enabled" in (result.reason or "")
 
 
-def test_validate_order_blocks_missing_quote(
+def test_mock_mints_fallback_quote_for_enabled_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The mock simulator mints a synthetic quote for any *enabled*
+    # symbol it wasn't explicitly seeded with, so equities/options it
+    # doesn't pre-know still validate. Real adapters keep their own
+    # missing-quote guards.
+    settings = _settings(monkeypatch)
+    broker = MockBroker(enabled_symbols=["MES"])
+    broker._quotes.pop("MES")  # noqa: SLF001 — force the fallback path
+    result = broker.validate_order(symbol="MES", qty=1, side="buy")
+    assert result.valid
+    assert result.quote is not None
+
+
+def test_mock_blocks_disabled_symbol_without_quote(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings(monkeypatch)
     broker = MockBroker(enabled_symbols=["MES"])
-    broker._quotes.pop("MES")  # noqa: SLF001 — testing missing-quote path
-    result = broker.validate_order(symbol="MES", qty=1, side="buy")
+    result = broker.validate_order(symbol="ZZZZ", qty=1, side="buy")
     assert not result.valid
-    assert "no quote" in (result.reason or "").lower()
+    assert "not enabled" in (result.reason or "").lower()
 
 
 def test_limit_order_payload_valid(monkeypatch: pytest.MonkeyPatch) -> None:

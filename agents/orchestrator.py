@@ -24,6 +24,7 @@ The orchestrator imports nothing from ``execution`` or ``risk`` —
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,7 +35,7 @@ from sqlalchemy import select
 from agents.backtest_critic_agent import BacktestCriticAgent
 from agents.base_agent import AgentContext, BaseAgent
 from agents.data_quality_agent import DataQualityAgent
-from agents.llm_client import LLMClient
+from agents.llm_client import LLMClient, LLMClientError
 from agents.macro_news_agent import MacroNewsAgent
 from agents.model_drift_agent import ModelDriftAgent
 from agents.model_review_agent import ModelReviewAgent
@@ -536,6 +537,67 @@ class AgentOrchestrator:
             )
             return None
 
+    def propose_watchlist_symbols(
+        self,
+        *,
+        allowlist: list[str],
+        max_symbols: int = 12,
+        now: Optional[datetime] = None,
+    ) -> list[str]:
+        """Advisory watchlist: rank which *allowlist* names to prioritize.
+
+        Uses the web-grounded research provider (Perplexity by default via
+        the ``strategy_research`` route) to surface names with notable
+        catalysts/relative strength today. This is strictly advisory:
+
+        - It can only return symbols that are already on ``allowlist`` —
+          the caller (and this method) filter anything else out, so the
+          LLM cannot inject an arbitrary ticker.
+        - It never places a trade, changes risk, or promotes a model.
+        - Any failure returns ``[]`` and the loop falls back to the
+          deterministic allowlist order.
+        """
+        # Use the fast web-grounded route (macro_news → sonar-pro) rather
+        # than the heavy strategy_research model (sonar-deep-research),
+        # which is too slow for a per-session watchlist and would time out.
+        client = self._client_for("macro_news") or self._client_for("news")
+        if client is None:
+            self.log.info("agents.disabled", phase="watchlist")
+            return []
+        allowed = {s.upper() for s in allowlist}
+        if not allowed:
+            return []
+        system = (
+            "You are an advisory market scanner for a paper-trading bot. "
+            "From the provided allowlist of liquid US equities/ETFs, pick "
+            "the names most worth scanning intraday today based on notable "
+            "catalysts, news, or relative strength. You do NOT place trades "
+            "or give buy/sell advice — you only narrow a scan list. "
+            "Respond with STRICT JSON: {\"symbols\": [\"TICKER\", ...]}. "
+            "Only use tickers from the allowlist. No prose."
+        )
+        user = (
+            f"Allowlist: {sorted(allowed)}\n"
+            f"Return at most {max_symbols} tickers, highest priority first."
+        )
+        try:
+            raw = client.complete(system=system, user=user)
+        except LLMClientError as e:
+            self.log.warning("agents.watchlist.llm_failed", error=str(e))
+            return []
+        except Exception as e:  # noqa: BLE001
+            self.log.warning("agents.watchlist.unexpected", error=str(e))
+            return []
+
+        tickers = _extract_ticker_list(raw)
+        picked = [t for t in tickers if t.upper() in allowed][:max_symbols]
+        self.log.info(
+            "agents.watchlist.proposed",
+            n=len(picked),
+            picked=picked,
+        )
+        return picked
+
     def run_backtest_critic(
         self,
         backtest_summary: dict[str, Any],
@@ -686,6 +748,37 @@ class AgentOrchestrator:
             self.notifier.notify(kind, **payload)
         except Exception as e:  # pragma: no cover - notify is supposed to catch
             self.log.warning("agents.notify_failed", kind=kind, error=str(e))
+
+
+_TICKER_RE = re.compile(r"\b[A-Z]{1,6}\b")
+
+
+def _extract_ticker_list(raw: str) -> list[str]:
+    """Parse tickers from an LLM watchlist response, defensively.
+
+    Accepts strict JSON ``{"symbols": [...]}``, a bare JSON array, or
+    (last resort) a regex sweep of uppercase tokens. Never raises.
+    """
+    if not raw:
+        return []
+    text = raw.strip()
+    # Strip markdown code fences if present.
+    if text.startswith("```"):
+        text = text.strip("`")
+        nl = text.find("\n")
+        if nl != -1:
+            text = text[nl + 1 :]
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and isinstance(data.get("symbols"), list):
+            return [str(s).strip().upper() for s in data["symbols"] if str(s).strip()]
+        if isinstance(data, list):
+            return [str(s).strip().upper() for s in data if str(s).strip()]
+    except (ValueError, TypeError):
+        pass
+    # Last resort: sweep already-uppercase tokens (likely tickers),
+    # filtered against the allowlist by the caller anyway.
+    return list(dict.fromkeys(_TICKER_RE.findall(text)))
 
 
 # ---------------------------------------------------------------------------
