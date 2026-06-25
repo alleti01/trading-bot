@@ -64,8 +64,8 @@ def test_strategy_emits_long_setup() -> None:
     assert s.direction == "long"
     assert s.entry_price == 101.0
     assert s.atr_at_entry == 1.0
-    assert s.stop_price == 100.0  # entry - 1.0 * 1.0
-    assert s.target_price == 103.0  # entry + 2.0 * 1.0
+    assert s.stop_price == 100.25  # entry - 0.75 * 1.0
+    assert s.target_price == 102.5  # entry + 1.5 * 1.0
 
 
 def test_strategy_emits_short_setup() -> None:
@@ -80,8 +80,8 @@ def test_strategy_emits_short_setup() -> None:
     s = setups[0]
     assert s.direction == "short"
     assert s.entry_price == 99.0
-    assert s.stop_price == 100.0
-    assert s.target_price == 97.0
+    assert s.stop_price == 99.75  # entry + 0.75 * 1.0
+    assert s.target_price == 97.5  # entry - 1.5 * 1.0
 
 
 def test_strategy_skips_when_volume_too_low() -> None:

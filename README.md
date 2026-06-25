@@ -495,6 +495,23 @@ Per cycle, for each symbol: refresh bars → `SignalEngine` → long-only
 filter → risk caps → bracket order → Discord alert. Outside the trading
 window it sleeps without scanning. LIVE is refused; DRY_RUN never orders.
 
+#### Daily risk guardrails (enforced every cycle)
+
+Before any entry, the loop applies deterministic daily caps and stops
+the session when they trip:
+
+| Guardrail | Behavior |
+|-----------|----------|
+| `MAX_DAILY_LOSS` | Flatten all positions + **halt** new entries for the day |
+| `MAX_DAILY_PROFIT` | Stop opening new trades for the day (lock in) |
+| `MAX_TRADES_PER_DAY` | Block further entries once reached |
+| `FORCE_FLAT_TIME` | Flatten all open positions at session close |
+| Already held / working order | Dedupe — never stack a second order on the same symbol |
+
+Day P&L comes from the broker account; position/order reconciliation
+runs once per cycle so the loop never double-enters a name it already
+holds. Counters reset at the start of each session date.
+
 #### Dynamic universe (research-agent watchlist, allowlist-gated)
 
 By default the loop scans `ENABLED_SYMBOLS`. Set

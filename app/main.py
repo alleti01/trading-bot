@@ -274,6 +274,22 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Force workflow to run (e.g. weekly-review on non-Friday).",
     )
     parser.add_argument(
+        "--train-universe",
+        action="store_true",
+        help=(
+            "Train a single equity model from pooled multi-symbol data "
+            "(data/historical/<SYM>/1m.csv across --train-symbols or the "
+            "liquid allowlist). Requires --model-name. Writes to the "
+            "local model registry only."
+        ),
+    )
+    parser.add_argument(
+        "--train-symbols",
+        type=str,
+        default=None,
+        help="Comma-separated symbols for --train-universe (default: allowlist).",
+    )
+    parser.add_argument(
         "--download-data",
         action="store_true",
         help=(
@@ -1840,6 +1856,50 @@ def _run_promote_model(settings: Settings, log, *, args) -> int:
     return 0
 
 
+def _run_train_universe(settings: Settings, log, *, args: argparse.Namespace) -> int:
+    """Train a pooled multi-symbol equity model and register it."""
+    from config.equity_allowlist import LIQUID_EQUITY_ALLOWLIST
+    from models.equity_trainer import EquityTrainError, train_universe_model
+
+    if not args.model_name:
+        log.error("train_universe.missing_model_name", note="Requires --model-name NAME.")
+        return 4
+
+    if args.train_symbols:
+        symbols = [s.strip().upper() for s in args.train_symbols.split(",") if s.strip()]
+    else:
+        symbols = sorted(LIQUID_EQUITY_ALLOWLIST)
+
+    try:
+        result = train_universe_model(
+            settings,
+            symbols=symbols,
+            model_name=args.model_name,
+            model_kind=args.model_kind,
+            strategy_name=args.strategy or "vwap_ema_pullback",
+            max_hold_bars=args.max_hold_bars,
+            train_frac=float(args.train_frac),
+            val_frac=float(args.val_frac),
+        )
+    except EquityTrainError as e:
+        log.error("train_universe.failed", error=str(e))
+        return 4
+    except Exception as e:  # noqa: BLE001
+        log.error("train_universe.unexpected", error=str(e))
+        return 5
+
+    log.info(
+        "train_universe.complete",
+        model_name=result.model_name,
+        version=result.version,
+        symbols_used=result.symbols_used,
+        n_setups=result.n_total_setups,
+        n_pos=result.n_pos,
+        test_metrics=result.test_metrics,
+    )
+    return 0
+
+
 def _run_download_data(settings: Settings, log, *, args: argparse.Namespace) -> int:
     """Download historical bars from Alpaca into the historical data dir."""
     from data.alpaca_bars import download_symbols
@@ -2080,6 +2140,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.download_data:
         return _run_download_data(settings, log, args=args)
+
+    if args.train_universe:
+        return _run_train_universe(settings, log, args=args)
 
     if args.workflow_intraday:
         return _run_intraday_cli(settings, log, args=args)

@@ -59,6 +59,94 @@ class IntradayLoop:
         # once per session date and reuse across the 5-min scans.
         self._watchlist_cache: list[str] = []
         self._watchlist_day: Optional[str] = None
+        # Per-session daily risk state (reset on new session date).
+        self._risk_day: Optional[str] = None
+        self._trades_today = 0
+        self._halted_today = False
+        self._halt_reason = ""
+
+    # ------------------------------------------------------------------
+    # Daily risk + reconciliation helpers
+    # ------------------------------------------------------------------
+    def _reset_daily_state(self, now: datetime) -> None:
+        from scheduler.market_hours import session_date
+
+        day = session_date(now, self.settings).isoformat()
+        if day != self._risk_day:
+            self._risk_day = day
+            self._trades_today = 0
+            self._halted_today = False
+            self._halt_reason = ""
+            self.log.info("intraday.session_reset", day=day)
+
+    def _day_pnl(self, broker) -> float:  # noqa: ANN001
+        """Best-effort day P&L from the broker account (0.0 if unknown)."""
+        try:
+            acct = broker.get_account()
+            return float(getattr(acct, "realized_pnl", 0.0) or 0.0)
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    def _daily_risk_block(self, broker, now: datetime) -> tuple[bool, bool, str]:
+        """Return (block_entries, flatten_now, reason).
+
+        Enforces the deterministic daily caps the autonomous loop was
+        previously missing: max trades/day, daily loss (flatten + halt),
+        daily profit (stop for the day), and force-flat at session close.
+        """
+        if self._halted_today:
+            return True, False, self._halt_reason
+
+        from scheduler.market_hours import is_force_flat_due
+
+        if is_force_flat_due(now, self.settings):
+            return True, True, "force_flat_eod"
+
+        if self._trades_today >= self.settings.MAX_TRADES_PER_DAY:
+            return True, False, "max_trades_per_day"
+
+        day_pnl = self._day_pnl(broker)
+        if self.settings.MAX_DAILY_LOSS > 0 and day_pnl <= -abs(self.settings.MAX_DAILY_LOSS):
+            return True, True, f"daily_loss_limit ({day_pnl:.2f})"
+        if self.settings.MAX_DAILY_PROFIT > 0 and day_pnl >= abs(self.settings.MAX_DAILY_PROFIT):
+            return True, False, f"daily_profit_target ({day_pnl:.2f})"
+
+        return False, False, ""
+
+    @staticmethod
+    def _held_or_pending(reconcile: dict) -> set[str]:
+        held: set[str] = set()
+        for p in reconcile.get("positions", []) or []:
+            sym = str(p.get("symbol", "")).upper()
+            if sym:
+                held.add(sym)
+        for o in reconcile.get("orders", []) or []:
+            sym = str(o.get("symbol", "")).upper()
+            if sym:
+                held.add(sym)
+        return held
+
+    def _flatten_all(self, broker, reconcile: dict, *, reason: str) -> int:
+        from integrations.broker_base import BrokerError
+
+        closed = 0
+        for p in reconcile.get("positions", []) or []:
+            sym = str(p.get("symbol", "")).upper()
+            if not sym:
+                continue
+            try:
+                result = broker.close_position(symbol=sym)
+                if getattr(result, "success", False):
+                    closed += 1
+                    self._notify_safe(
+                        "trade.closed", instrument=sym, reason=reason,
+                        source="workflow.intraday",
+                    )
+            except BrokerError as e:
+                self.log.warning("intraday.flatten_failed", symbol=sym, error=str(e))
+        if closed:
+            self.log.info("intraday.flattened", closed=closed, reason=reason)
+        return closed
 
     # ------------------------------------------------------------------
     # Universe
@@ -100,6 +188,7 @@ class IntradayLoop:
 
         now = now or datetime.now(tz=timezone.utc)
         self._scans += 1
+        self._reset_daily_state(now)
         universe = self._universe(now=now)
 
         # Data refresh is read-only market data — safe in dry-run too, so
@@ -126,8 +215,32 @@ class IntradayLoop:
         )
 
         # Reconcile once per cycle before placing new orders.
-        if resolve_order_broker(ctx) is not None:
-            prepare_broker(ctx)
+        reconcile_info: dict[str, Any] = {}
+        order_broker = resolve_order_broker(ctx)
+        if order_broker is not None:
+            reconcile_info = prepare_broker(ctx)
+
+        # ---- Daily risk gate (deterministic, applies before any entry) ---
+        risk_block = False
+        risk_reason = ""
+        if order_broker is not None and not self.dry_run:
+            risk_block, flatten_now, risk_reason = self._daily_risk_block(order_broker, now)
+            if flatten_now:
+                self._flatten_all(order_broker, reconcile_info, reason=risk_reason)
+            if risk_block:
+                if risk_reason.startswith("daily_loss") or risk_reason == "force_flat_eod":
+                    self._halted_today = True
+                    self._halt_reason = risk_reason
+                self.log.info("intraday.risk_block", reason=risk_reason, scan=self._scans)
+                return {
+                    "scan": self._scans,
+                    "universe_size": len(universe),
+                    "entered": 0,
+                    "risk_block": risk_reason,
+                    "results": [],
+                }
+
+        held_or_pending = self._held_or_pending(reconcile_info)
 
         engine = SignalEngine(
             self.settings,
@@ -137,7 +250,9 @@ class IntradayLoop:
 
         results: list[dict[str, Any]] = []
         broker_state = ctx.broker.pull_state(now=now)
-        open_positions = broker_state.account.open_positions
+        open_positions = max(
+            broker_state.account.open_positions, len(held_or_pending)
+        )
 
         for sym in universe:
             if ctx.entries_blocked:
@@ -145,6 +260,14 @@ class IntradayLoop:
                 continue
             if open_positions >= self.settings.MAX_OPEN_POSITIONS:
                 results.append({"symbol": sym, "action": "skip", "reason": "max_open_positions"})
+                continue
+            # Dedupe: never stack a new order on a symbol we already hold
+            # or have a working order for.
+            if sym.upper() in held_or_pending:
+                results.append({"symbol": sym, "action": "skip", "reason": "already_held_or_pending"})
+                continue
+            if not self.dry_run and self._trades_today >= self.settings.MAX_TRADES_PER_DAY:
+                results.append({"symbol": sym, "action": "skip", "reason": "max_trades_per_day"})
                 continue
 
             try:
@@ -191,7 +314,9 @@ class IntradayLoop:
             )
             if ok:
                 self._orders += 1
+                self._trades_today += 1
                 open_positions += 1
+                held_or_pending.add(sym.upper())
                 results.append(
                     {"symbol": sym, "action": "enter", "direction": signal.direction,
                      "order_id": entry.order_id if entry else None}

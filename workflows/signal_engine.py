@@ -106,6 +106,15 @@ class SignalEngine:
             self.log.info("signal.no_data", symbol=symbol)
             return None
 
+        # Dynamic-universe symbols (allowlist equities) may not be in the
+        # instrument registry yet. Mint an equity spec on demand so the
+        # feature builder can look it up — futures/known symbols keep
+        # their existing spec.
+        from config.instruments import is_supported_symbol, register_equity
+
+        if not is_supported_symbol(symbol):
+            register_equity(symbol)
+
         df = df.copy()
         df["instrument"] = symbol.upper()
         df["timeframe"] = "1m"
