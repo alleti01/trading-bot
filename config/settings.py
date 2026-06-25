@@ -243,6 +243,16 @@ class Settings(BaseSettings):
     STRATEGY_SKIP_OPEN_MINUTES: float = Field(default=0.0, ge=0)
     STRATEGY_SKIP_CLOSE_MINUTES: float = Field(default=0.0, ge=0)
 
+    # ---- Minimum stop distance (anti-whipsaw) -------------------------
+    # On calm large-caps/ETFs a 0.75-ATR stop can be sub-spread (e.g. a
+    # $0.42 stop on $715 QQQ), which real fills whipsaw out instantly.
+    # Floor the stop distance at max(MIN_STOP_DISTANCE_PCT * price,
+    # MIN_STOP_DISTANCE_CENTS); the target widens proportionally to keep
+    # the reward:risk ratio, and risk-based sizing trims shares so the
+    # dollar risk per trade stays the same.
+    MIN_STOP_DISTANCE_PCT: float = Field(default=0.0015, ge=0.0)
+    MIN_STOP_DISTANCE_CENTS: float = Field(default=0.05, ge=0.0)
+
     # ---- Continuous intraday loop + dynamic universe -------------------
     # The intraday loop re-scans the universe every N minutes during the
     # trading window and places bracket orders on approved setups.

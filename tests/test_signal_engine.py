@@ -65,6 +65,62 @@ def test_signal_strategy_only_mode_is_approved(monkeypatch) -> None:
         assert signal.approved is True
 
 
+def test_min_stop_floor_widens_tight_stop(monkeypatch) -> None:
+    # A $0.42 stop on a $715 instrument is below the 0.15% floor (~$1.07);
+    # the floor widens it and the target proportionally (preserving R:R).
+    settings = _settings(monkeypatch)
+    eng = SignalEngine(settings)
+
+    from datetime import datetime, timezone
+
+    from strategies.base import Setup
+    from features.feature_builder import FEATURE_COLUMNS
+
+    feats = {c: 0.0 for c in FEATURE_COLUMNS}
+    setup = Setup(
+        instrument="QQQ",
+        timestamp=datetime(2026, 6, 17, 14, 30, tzinfo=timezone.utc),
+        strategy_name="vwap_ema_pullback",
+        direction="long",
+        entry_price=715.42,
+        stop_price=715.0,      # $0.42 risk — sub-floor
+        target_price=716.26,   # ~2x risk
+        atr_at_entry=0.56,
+        features=feats,
+        bar_index=0,
+    )
+    entry, stop, target = eng._apply_min_stop_floor(setup)
+    floor = max(0.0015 * entry, 0.05)
+    assert entry == 715.42
+    assert abs((entry - stop) - floor) < 1e-3           # stop widened to floor
+    assert abs((target - entry) / (entry - stop) - 2.0) < 0.05  # R:R preserved
+
+
+def test_min_stop_floor_leaves_wide_stop_alone(monkeypatch) -> None:
+    settings = _settings(monkeypatch)
+    eng = SignalEngine(settings)
+
+    from datetime import datetime, timezone
+
+    from strategies.base import Setup
+    from features.feature_builder import FEATURE_COLUMNS
+
+    setup = Setup(
+        instrument="SPY",
+        timestamp=datetime(2026, 6, 17, 14, 30, tzinfo=timezone.utc),
+        strategy_name="vwap_ema_pullback",
+        direction="long",
+        entry_price=100.0,
+        stop_price=98.0,    # $2 risk — already well above floor
+        target_price=104.0,
+        atr_at_entry=2.0,
+        features={c: 0.0 for c in FEATURE_COLUMNS},
+        bar_index=0,
+    )
+    entry, stop, target = eng._apply_min_stop_floor(setup)
+    assert (entry, stop, target) == (100.0, 98.0, 104.0)  # unchanged
+
+
 def test_signal_engine_handles_bad_model_gracefully(monkeypatch) -> None:
     settings = _settings(monkeypatch)
     df = synthetic_ohlcv(n_bars=300, base_price=550.0)

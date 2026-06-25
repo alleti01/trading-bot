@@ -164,6 +164,9 @@ class SignalEngine:
         if setup is None:
             return None
 
+        # Floor the stop distance so calm names don't get sub-noise stops.
+        entry_price, stop_price, target_price = self._apply_min_stop_floor(setup)
+
         confidence: Optional[float] = None
         approved = True
         if self._predictor is not None:
@@ -180,9 +183,9 @@ class SignalEngine:
             return WorkflowSignal(
                 symbol=symbol.upper(),
                 direction=setup.direction,
-                entry_price=setup.entry_price,
-                stop_price=setup.stop_price,
-                target_price=setup.target_price,
+                entry_price=entry_price,
+                stop_price=stop_price,
+                target_price=target_price,
                 confidence=confidence,
                 approved=False,
                 model_name=self.model_name,
@@ -192,14 +195,51 @@ class SignalEngine:
         return WorkflowSignal(
             symbol=symbol.upper(),
             direction=setup.direction,
-            entry_price=setup.entry_price,
-            stop_price=setup.stop_price,
-            target_price=setup.target_price,
+            entry_price=entry_price,
+            stop_price=stop_price,
+            target_price=target_price,
             confidence=confidence,
             approved=True,
             model_name=self.model_name,
             reason="strategy_signal" if self._predictor is None else "model_approved",
         )
+
+    def _apply_min_stop_floor(self, setup: Setup) -> tuple[float, float, float]:
+        """Widen a sub-floor stop (and target, keeping R:R) to survive noise.
+
+        Returns ``(entry, stop, target)``. The floor is
+        ``max(MIN_STOP_DISTANCE_PCT * entry, MIN_STOP_DISTANCE_CENTS)``.
+        Risk-based sizing later trims shares so the dollar risk per trade
+        is unchanged by the wider stop.
+        """
+        entry = float(setup.entry_price)
+        stop = float(setup.stop_price)
+        target = float(setup.target_price)
+        risk = abs(entry - stop)
+        if risk <= 0:
+            return entry, stop, target
+        rr = abs(target - entry) / risk  # preserve reward:risk
+
+        floor = max(
+            float(self.settings.MIN_STOP_DISTANCE_PCT) * entry,
+            float(self.settings.MIN_STOP_DISTANCE_CENTS),
+        )
+        if risk >= floor:
+            return entry, stop, target
+
+        if setup.direction == "long":
+            new_stop = entry - floor
+            new_target = entry + rr * floor
+        else:
+            new_stop = entry + floor
+            new_target = entry - rr * floor
+        self.log.info(
+            "signal.stop_floored",
+            symbol=setup.instrument,
+            old_risk=round(risk, 4),
+            new_risk=round(floor, 4),
+        )
+        return entry, round(new_stop, 4), round(new_target, 4)
 
     def _resolve(self, setups: list[Setup]) -> Optional[Setup]:
         if len(setups) == 1:
