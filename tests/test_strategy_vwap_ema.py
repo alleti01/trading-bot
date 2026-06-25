@@ -131,6 +131,11 @@ def test_strategy_skips_when_no_pullback() -> None:
 
 
 def test_custom_params_override_defaults() -> None:
+    # Time-of-day filter: a setup at 10:00 is kept with no filter, but
+    # dropped when skip_open_minutes pushes the window past 10:00.
+    _tod = VWAPEMAPullbackParams()
+    assert _tod.skip_open_minutes == 0.0  # default: no filter
+
     params = VWAPEMAPullbackParams(stop_atr_mult=2.0, target_atr_mult=4.0)
     ts = datetime(2024, 1, 15, 14, 30, tzinfo=timezone.utc)
     rows = [

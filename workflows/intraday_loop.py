@@ -302,11 +302,12 @@ class IntradayLoop:
                 )
                 continue
 
+            qty = self._size_position(sym, signal)
             ok, entry, _ = execute_entry_with_stops(
                 ctx,
                 symbol=sym,
                 side=signal.direction,
-                quantity=float(self.settings.MAX_POSITION_SIZE),
+                quantity=qty,
                 entry_price=signal.entry_price,
                 stop_price=signal.stop_price,
                 target_price=signal.target_price,
@@ -348,6 +349,29 @@ class IntradayLoop:
             dry_run=self.dry_run,
         )
         return summary
+
+    def _size_position(self, symbol: str, signal) -> float:  # noqa: ANN001
+        """Risk-based share count for equities; fixed size otherwise."""
+        if not self.settings.USE_RISK_BASED_SIZING:
+            return float(self.settings.MAX_POSITION_SIZE)
+        try:
+            from config.instruments import is_supported_symbol, register_equity
+            from risk.position_sizing import size_equity_shares
+
+            if not is_supported_symbol(symbol):
+                register_equity(symbol)
+            res = size_equity_shares(
+                entry_price=signal.entry_price,
+                stop_price=signal.stop_price,
+                instrument=symbol,
+                risk_per_trade=float(self.settings.RISK_PER_TRADE),
+                max_shares=int(self.settings.MAX_SHARES_PER_TRADE),
+                max_notional=float(self.settings.MAX_NOTIONAL_PER_TRADE),
+            )
+            return float(res.quantity)
+        except Exception as e:  # noqa: BLE001
+            self.log.warning("intraday.sizing_failed", symbol=symbol, error=str(e))
+            return float(self.settings.MAX_POSITION_SIZE)
 
     def _refresh_data(self, symbols: list[str]) -> None:
         try:

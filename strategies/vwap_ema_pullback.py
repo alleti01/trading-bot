@@ -35,6 +35,11 @@ class VWAPEMAPullbackParams(StrategyParams):
     # cut losers faster; this is the best-validated config from the sweep.
     stop_atr_mult: float = Field(default=0.75, gt=0)
     target_atr_mult: float = Field(default=1.5, gt=0)
+    # Time-of-day filter (minutes from the RTH 09:30–16:00 session edges).
+    # 0 = no filtering. Skipping the noisy open/close often helps
+    # tight-stop strategies. Applied to setups by their bar timestamp.
+    skip_open_minutes: float = Field(default=0.0, ge=0)
+    skip_close_minutes: float = Field(default=0.0, ge=0)
 
 
 class VWAPEMAPullback(Strategy):
@@ -96,14 +101,36 @@ class VWAPEMAPullback(Strategy):
         long_signal = long_trend & near_anchor & vol_ok & atr_band_ok
         short_signal = short_trend & near_anchor & vol_ok & atr_band_ok
 
+        # Time-of-day mask: drop setups within skip_open/skip_close minutes
+        # of the RTH session edges (09:30 = 570 min, 16:00 = 960 min).
+        tod_ok = self._time_of_day_mask(features_df.index, p)
+
         setups: list[Setup] = []
         for i, ts in enumerate(features_df.index):
+            if not tod_ok[i]:
+                continue
             if long_signal.iloc[i]:
                 setups.append(self._build_setup(features_df, i, ts, "long"))
             elif short_signal.iloc[i]:
                 setups.append(self._build_setup(features_df, i, ts, "short"))
 
         return setups
+
+    @staticmethod
+    def _time_of_day_mask(index, p: "VWAPEMAPullbackParams"):  # noqa: ANN001
+        """Boolean list: True where the bar is outside the skip windows."""
+        n = len(index)
+        if p.skip_open_minutes <= 0 and p.skip_close_minutes <= 0:
+            return [True] * n
+        session_open = 9 * 60 + 30  # 570
+        session_close = 16 * 60     # 960
+        lo = session_open + p.skip_open_minutes
+        hi = session_close - p.skip_close_minutes
+        out = []
+        for ts in index:
+            minute = ts.hour * 60 + ts.minute
+            out.append(lo <= minute <= hi)
+        return out
 
     # ----------------------------------------------------------------------
     # Helpers

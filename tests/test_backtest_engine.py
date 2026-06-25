@@ -278,4 +278,10 @@ def test_no_hedging_blocks_opposite_direction_in_engine() -> None:
     engine = BacktestEngine(settings=settings)
     result = engine.run(df, [long_setup, short_setup])
     assert result.metrics.n_trades == 1
-    assert any(rb.rule in {"max_open_positions", "no_hedging"} for rb in result.risk_blocks)
+    # The single-position book blocks any second entry while one is open
+    # (which inherently prevents hedging), via the risk engine or the
+    # engine's own position-open guard.
+    assert any(
+        rb.rule in {"max_open_positions", "no_hedging", "position_already_open"}
+        for rb in result.risk_blocks
+    )

@@ -290,6 +290,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Comma-separated symbols for --train-universe (default: allowlist).",
     )
     parser.add_argument(
+        "--paper-report",
+        action="store_true",
+        help=(
+            "Print a live paper-account evaluation snapshot (equity, day "
+            "P&L, open positions, working orders) from the broker and "
+            "send a Discord summary."
+        ),
+    )
+    parser.add_argument(
         "--download-data",
         action="store_true",
         help=(
@@ -1856,6 +1865,28 @@ def _run_promote_model(settings: Settings, log, *, args) -> int:
     return 0
 
 
+def _run_paper_report(settings: Settings, log) -> int:
+    """Build + print a live paper-account evaluation snapshot."""
+    import json
+
+    from notifications.notification_service import NotificationService
+    from reports.live_paper_report import build_live_paper_report, discord_summary_lines
+
+    payload = build_live_paper_report(settings)
+    print(json.dumps(payload, indent=2, default=str))
+    try:
+        notifier = NotificationService.from_settings(settings)
+        notifier.notify(
+            "eod.summary",
+            source="paper_report",
+            lines=discord_summary_lines(payload),
+            headline=discord_summary_lines(payload)[0],
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("paper_report.notify_failed", error=str(e))
+    return 0 if payload.get("ok") else 5
+
+
 def _run_train_universe(settings: Settings, log, *, args: argparse.Namespace) -> int:
     """Train a pooled multi-symbol equity model and register it."""
     from config.equity_allowlist import LIQUID_EQUITY_ALLOWLIST
@@ -2143,6 +2174,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.train_universe:
         return _run_train_universe(settings, log, args=args)
+
+    if args.paper_report:
+        return _run_paper_report(settings, log)
 
     if args.workflow_intraday:
         return _run_intraday_cli(settings, log, args=args)

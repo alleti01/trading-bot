@@ -83,7 +83,19 @@ class SignalEngine:
     def _strategies_for(self, symbol: str):
         from strategies.registry import instantiate_enabled
 
-        return instantiate_enabled(self.settings, instrument=symbol)
+        strategies = instantiate_enabled(self.settings, instrument=symbol)
+        # Apply the operator's time-of-day filter to the VWAP/EMA strategy
+        # without disturbing other strategies or the registry defaults.
+        skip_open = float(getattr(self.settings, "STRATEGY_SKIP_OPEN_MINUTES", 0.0))
+        skip_close = float(getattr(self.settings, "STRATEGY_SKIP_CLOSE_MINUTES", 0.0))
+        if skip_open > 0 or skip_close > 0:
+            from strategies.vwap_ema_pullback import VWAPEMAPullback
+
+            for strat in strategies:
+                if isinstance(strat, VWAPEMAPullback):
+                    strat.params.skip_open_minutes = skip_open
+                    strat.params.skip_close_minutes = skip_close
+        return strategies
 
     def _load_ohlcv(self, symbol: str) -> Optional[pd.DataFrame]:
         path = Path(self.settings.HISTORICAL_DATA_DIR) / symbol.upper() / "1m.csv"

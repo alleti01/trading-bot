@@ -533,6 +533,26 @@ still passes the deterministic gate: data → VWAP/EMA setup → model →
 risk → broker validation. `ENABLED_SYMBOLS` are always scanned first;
 the cap bounds total symbols per cycle.
 
+### Position sizing, time-of-day filter, paper report, deployment
+
+- **Risk-based sizing** (`USE_RISK_BASED_SIZING=true`): equity trades are
+  sized as `RISK_PER_TRADE / per-share stop distance`, capped by
+  `MAX_SHARES_PER_TRADE` and `MAX_NOTIONAL_PER_TRADE` — so a $50 and a
+  $900 stock risk the same and never exceed buying power.
+- **Time-of-day filter** (`STRATEGY_SKIP_OPEN_MINUTES` /
+  `STRATEGY_SKIP_CLOSE_MINUTES`): skip the noisy RTH open/close.
+- **Live paper report**: `python -m app.main --paper-report` prints a
+  broker-sourced snapshot (equity, day P&L, positions, working orders)
+  and sends a Discord summary.
+- **Deployment**: `deploy/` has a `run_intraday.sh` wrapper, a macOS
+  `launchd` plist, and a Linux `systemd` unit for hands-off auto-start.
+  See `deploy/README.md`.
+
+> **Out-of-sample validation:** the 0.75/1.5 R:R was confirmed on a
+> 75/25 time split — test-set profit factor 1.069 (positive), vs the old
+> 1.0/2.0 which went negative out-of-sample (PF 0.952). PDT rules do not
+> apply to paper accounts; revisit before any live trading.
+
 ### Live data ingestion (Alpaca bars)
 
 Download real 1-minute bars into the repo convention

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS launchd agent: auto-start the intraday paper loop at login and
+  restart it if it dies. Install:
+
+    cp deploy/com.tradeify.intraday.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.tradeify.intraday.plist
+
+  Stop / uninstall:
+
+    launchctl unload ~/Library/LaunchAgents/com.tradeify.intraday.plist
+
+  The Mac must be on + awake during market hours (9:30-16:00 ET). The
+  loop idles outside the trading window automatically.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tradeify.intraday</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/anishalleti/tradeify trading bot/deploy/run_intraday.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/anishalleti/tradeify trading bot</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/anishalleti/tradeify trading bot/logs/intraday.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/anishalleti/tradeify trading bot/logs/intraday.err.log</string>
+</dict>
+</plist>

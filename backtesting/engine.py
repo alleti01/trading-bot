@@ -292,6 +292,26 @@ class BacktestEngine:
     ) -> None:
         ts_py = ts.to_pydatetime() if isinstance(ts, pd.Timestamp) else ts
 
+        # 0) Single-position book: the backtester holds at most one
+        #    position at a time. If MAX_OPEN_POSITIONS > 1 the risk engine
+        #    might approve a second entry, but the Portfolio cannot hold
+        #    it — skip rather than crash. (Equities have no intraday
+        #    force-flat, so an open position commonly survives until a
+        #    later setup fires.)
+        if not self.portfolio.is_flat():
+            result.n_setups_risk_blocked += 1
+            result.risk_blocks.append(
+                RiskBlockRecord(
+                    setup_id=setup.id,
+                    instrument=setup.instrument,
+                    direction=setup.direction,
+                    timestamp=ts_py,
+                    rule="position_already_open",
+                    reason="single-position backtester already holds a position",
+                )
+            )
+            return
+
         # 1) Optional model gate.
         if self.predictor is not None:
             try:

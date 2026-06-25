@@ -226,6 +226,23 @@ class Settings(BaseSettings):
     # (safe). This is always the behavior; the flag documents intent.
     WORKFLOW_REQUIRE_SIGNAL: bool = True
 
+    # ---- Equity position sizing ---------------------------------------
+    # Workflow equity trades size by risk: shares = RISK_PER_TRADE /
+    # (stop distance per share), then capped by share count and notional
+    # dollars so a $50 stock and a $900 stock risk the same and never
+    # exceed buying power. Set USE_RISK_BASED_SIZING=false to fall back
+    # to the fixed MAX_POSITION_SIZE share count.
+    USE_RISK_BASED_SIZING: bool = True
+    MAX_SHARES_PER_TRADE: int = Field(default=100, ge=1)
+    MAX_NOTIONAL_PER_TRADE: float = Field(default=10_000.0, gt=0.0)
+
+    # ---- Strategy time-of-day filter ----------------------------------
+    # Skip VWAP/EMA setups within N minutes of the RTH open/close. The
+    # open/close are the noisiest periods; skipping them often helps the
+    # tight-stop config. 0 = no filter (default).
+    STRATEGY_SKIP_OPEN_MINUTES: float = Field(default=0.0, ge=0)
+    STRATEGY_SKIP_CLOSE_MINUTES: float = Field(default=0.0, ge=0)
+
     # ---- Continuous intraday loop + dynamic universe -------------------
     # The intraday loop re-scans the universe every N minutes during the
     # trading window and places bracket orders on approved setups.

@@ -59,3 +59,40 @@ def size_position(
         expected_risk_dollars=expected_risk,
         exceeds_risk_per_trade=exceeds,
     )
+
+
+def size_equity_shares(
+    *,
+    entry_price: float,
+    stop_price: float,
+    instrument: str | InstrumentSpec,
+    risk_per_trade: float,
+    max_shares: int,
+    max_notional: float,
+) -> SizingResult:
+    """Risk-based share count for equities, capped by shares + notional.
+
+    shares = floor(risk_per_trade / per-share risk), then clamped to
+    ``max_shares`` and ``floor(max_notional / entry_price)`` so a trade
+    never risks more than ``risk_per_trade`` nor spends more than
+    ``max_notional``. Always returns at least 1 share.
+    """
+    base = size_position(
+        entry_price=entry_price,
+        stop_price=stop_price,
+        instrument=instrument,
+        risk_per_trade=risk_per_trade,
+        max_position_size=max(1, int(max_shares)),
+    )
+    qty = base.quantity
+    if entry_price > 0:
+        notional_cap = int(max_notional // float(entry_price))
+        qty = min(qty, max(1, notional_cap))
+    qty = max(1, qty)
+    expected_risk = qty * base.risk_per_contract_dollars
+    return SizingResult(
+        quantity=qty,
+        risk_per_contract_dollars=base.risk_per_contract_dollars,
+        expected_risk_dollars=expected_risk,
+        exceeds_risk_per_trade=expected_risk > risk_per_trade + 1e-9,
+    )

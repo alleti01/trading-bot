@@ -1,0 +1,24 @@
+# systemd service for an always-on Linux box (e.g. your spare PC).
+# Install:
+#   sudo cp deploy/tradeify-intraday.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tradeify-intraday
+# Logs:  journalctl -u tradeify-intraday -f
+#
+# Edit User, WorkingDirectory, and ExecStart paths for your machine.
+[Unit]
+Description=Tradeify autonomous intraday paper loop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/trading-bot
+ExecStart=/home/YOUR_USER/trading-bot/.venv/bin/python -m app.main --workflow-intraday --no-workflow-dry-run
+Restart=always
+RestartSec=30
+# Inherit the .env in WorkingDirectory; do not put secrets in this file.
+
+[Install]
+WantedBy=multi-user.target
