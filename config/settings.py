@@ -261,6 +261,11 @@ class Settings(BaseSettings):
     WORKFLOW_REFRESH_DATA_EACH_SCAN: bool = True
     # Long-only ignores short setups (avoids short-borrow complications).
     WORKFLOW_LONG_ONLY: bool = True
+    # Stop opening NEW positions within this many minutes of the
+    # force-flat / close, so a fresh entry isn't force-flatted seconds
+    # later (the "entered at 3:52, flattened at 3:55, lost the spread"
+    # problem). Existing positions still ride their brackets until flat.
+    WORKFLOW_NO_ENTRY_MINUTES_BEFORE_CLOSE: int = Field(default=20, ge=0)
     # Dynamic universe: expand the scan set beyond ENABLED_SYMBOLS using
     # the vetted liquid allowlist (and optional research-agent ranking).
     # The LLM can only prioritize allowlist names — never invent tickers.

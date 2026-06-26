@@ -95,9 +95,42 @@ def test_no_block_when_within_limits(monkeypatch, tmp_path) -> None:
     loop = IntradayLoop(settings, dry_run=False)
     loop._reset_daily_state(_NOW)
     broker = _broker(day_pnl=-100.0)
-    with patch("scheduler.market_hours.is_force_flat_due", return_value=False):
+    with patch("scheduler.market_hours.is_force_flat_due", return_value=False), patch(
+        "scheduler.market_hours.minutes_until_force_flat", return_value=120.0
+    ):
         block, flatten, reason = loop._daily_risk_block(broker, _NOW)
     assert not block and not flatten
+
+
+def test_no_entry_near_close(monkeypatch, tmp_path) -> None:
+    settings = _settings(
+        monkeypatch, tmp_path, WORKFLOW_NO_ENTRY_MINUTES_BEFORE_CLOSE="20"
+    )
+    loop = IntradayLoop(settings, dry_run=False)
+    loop._reset_daily_state(_NOW)
+    broker = _broker(day_pnl=0.0)
+    # 10 minutes before force-flat → inside the 20-min no-entry window.
+    with patch("scheduler.market_hours.is_force_flat_due", return_value=False), patch(
+        "scheduler.market_hours.minutes_until_force_flat", return_value=10.0
+    ):
+        block, flatten, reason = loop._daily_risk_block(broker, _NOW)
+    assert block and not flatten
+    assert reason.startswith("near_close_no_entry")
+
+
+def test_entry_allowed_well_before_close(monkeypatch, tmp_path) -> None:
+    settings = _settings(
+        monkeypatch, tmp_path, WORKFLOW_NO_ENTRY_MINUTES_BEFORE_CLOSE="20"
+    )
+    loop = IntradayLoop(settings, dry_run=False)
+    loop._reset_daily_state(_NOW)
+    broker = _broker(day_pnl=0.0)
+    # 60 minutes before close → entries allowed.
+    with patch("scheduler.market_hours.is_force_flat_due", return_value=False), patch(
+        "scheduler.market_hours.minutes_until_force_flat", return_value=60.0
+    ):
+        block, flatten, reason = loop._daily_risk_block(broker, _NOW)
+    assert not block
 
 
 # ---------------------------------------------------------------------------

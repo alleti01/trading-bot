@@ -97,10 +97,21 @@ class IntradayLoop:
         if self._halted_today:
             return True, False, self._halt_reason
 
-        from scheduler.market_hours import is_force_flat_due
+        from scheduler.market_hours import (
+            is_force_flat_due,
+            minutes_until_force_flat,
+        )
 
         if is_force_flat_due(now, self.settings):
             return True, True, "force_flat_eod"
+
+        # No new entries in the final minutes before the close — a fresh
+        # entry would be force-flatted moments later, losing the spread.
+        cutoff = int(self.settings.WORKFLOW_NO_ENTRY_MINUTES_BEFORE_CLOSE)
+        if cutoff > 0:
+            mins_left = minutes_until_force_flat(now, self.settings)
+            if 0 < mins_left <= cutoff:
+                return True, False, f"near_close_no_entry ({mins_left:.0f}m left)"
 
         if self._trades_today >= self.settings.MAX_TRADES_PER_DAY:
             return True, False, "max_trades_per_day"

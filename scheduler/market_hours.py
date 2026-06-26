@@ -70,6 +70,19 @@ def is_force_flat_due(now: datetime, settings: _SettingsLike) -> bool:
     return local_t >= settings.force_flat_time()
 
 
+def minutes_until_force_flat(now: datetime, settings: _SettingsLike) -> float:
+    """Minutes from ``now`` until today's force-flat time (negative if past).
+
+    Used to stop opening new positions in the final minutes of the
+    session, so a fresh entry is never force-flatted seconds later.
+    """
+    tz = ZoneInfo(settings.TIMEZONE)
+    local = _local(now, tz)
+    ff = settings.force_flat_time()
+    ff_dt = datetime.combine(local.date(), ff, tzinfo=tz)
+    return (ff_dt - local).total_seconds() / 60.0
+
+
 def next_bar_boundary(now: datetime, *, timeframe_minutes: int = 1) -> datetime:
     """Round ``now`` up to the next bar boundary.
 
