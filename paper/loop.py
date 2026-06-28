@@ -51,6 +51,7 @@ from execution.base import Order
 from execution.paper_executor import KillSwitchActive, PaperExecutor
 from features.feature_builder import build_features
 from models.predictor import Predictor
+from notifications.trade_events import build_trade_closed_payload
 from risk.kill_switch import KillSwitch
 from risk.position_sizing import size_position
 from risk.risk_engine import RiskConfig, evaluate
@@ -339,10 +340,7 @@ class PaperTradingLoop:
 
         self.notifier.notify(
             "forced_flat",
-            instrument=record.instrument,
-            direction=record.direction,
-            net_pnl=round(record.net_pnl, 2),
-            ts=ts.isoformat(),
+            **build_trade_closed_payload(record, ts=ts),
         )
 
         # Day 8 hook also fires for forced-flat closes so the trade
@@ -423,11 +421,7 @@ class PaperTradingLoop:
 
         self.notifier.notify(
             "trade.closed",
-            instrument=record.instrument,
-            direction=record.direction,
-            exit_reason=record.exit_reason,
-            net_pnl=round(record.net_pnl, 2),
-            ts=bar_ts.isoformat(),
+            **build_trade_closed_payload(record, ts=bar_ts),
         )
 
         # Day 8: post-trade analysis hook. The callback is responsible for

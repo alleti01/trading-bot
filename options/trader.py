@@ -21,6 +21,7 @@ from typing import Any, Optional
 from app.logging_config import get_logger
 from config.settings import Settings
 from notifications.notification_service import NotificationService
+from notifications.trade_events import classify_result
 from options.chain import BaseChainProvider, SyntheticChainProvider
 from options.execution import (
     BaseOptionsExecutor,
@@ -276,13 +277,41 @@ class OptionsTrader:
     def manage(self, *, now: Optional[datetime] = None) -> list[dict[str, Any]]:
         actions = self.pm.manage_cycle(now=now)
         for action in actions:
-            self._notify(
-                "options.managed",
-                broker_provider=self.executor.provider_name,
-                underlying="",
-                strategy=self.settings.OPTIONS_STRATEGY,
-                action=action.get("action", "manage"),
-                symbol=action.get("occ", ""),
-                reason=action.get("reason", "manage_cycle"),
-            )
+            detail = action.get("detail") or {}
+            is_close = action.get("action") == "close" and isinstance(detail, dict)
+            if is_close and detail.get("realized_pnl") is not None:
+                self._notify_options_closed(action, detail)
+            else:
+                self._notify(
+                    "options.managed",
+                    broker_provider=self.executor.provider_name,
+                    underlying=detail.get("underlying", "") if isinstance(detail, dict) else "",
+                    strategy=self.settings.OPTIONS_STRATEGY,
+                    action=action.get("action", "manage"),
+                    symbol=action.get("occ", ""),
+                    reason=action.get("reason", "manage_cycle"),
+                )
         return actions
+
+    def _notify_options_closed(self, action: dict[str, Any], detail: dict[str, Any]) -> None:
+        """Emit a rich close alert reporting realised dollar PnL.
+
+        Mirrors the futures ``trade.closed`` layout so the Discord message
+        clearly says whether the option made or lost money and how much.
+        """
+        net = float(detail["realized_pnl"])
+        self._notify(
+            "options.closed",
+            broker_provider=self.executor.provider_name,
+            symbol=detail.get("underlying", "") or action.get("occ", ""),
+            direction=detail.get("option_type", ""),
+            result=classify_result(net),
+            exit_reason=action.get("reason", "manage_cycle"),
+            net_pnl=net,
+            return_pct=detail.get("realized_pnl_pct"),
+            entry_price=detail.get("entry_price"),
+            exit_price=detail.get("exit_price"),
+            quantity=detail.get("qty"),
+            contract=action.get("occ", ""),
+            strategy=self.settings.OPTIONS_STRATEGY,
+        )

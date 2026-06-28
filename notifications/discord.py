@@ -41,8 +41,31 @@ HIGH_PRIORITY_KINDS: frozenset[str] = frozenset(
         "system.error",
         "kill_switch.tripped",
         "eod.summary",
+        "options.closed",
     }
 )
+
+# Kinds that describe a *closed* trade and get the rich, human-readable
+# "Trade Closed" layout (gain/loss headline) instead of the generic
+# key/value dump.
+CLOSE_KINDS: frozenset[str] = frozenset(
+    {
+        "trade.closed",
+        "forced_flat",
+        "webhook.closed",
+        "options.closed",
+    }
+)
+
+
+def _fmt_signed_money(value: float) -> str:
+    sign = "+" if value > 0 else "-" if value < 0 else ""
+    return f"{sign}${abs(value):,.2f}"
+
+
+def _fmt_signed_pct(value: float) -> str:
+    sign = "+" if value > 0 else "-" if value < 0 else ""
+    return f"{sign}{abs(value):.2f}%"
 
 
 @dataclass(frozen=True)
@@ -116,18 +139,87 @@ class DiscordNotifier:
         self.log = get_logger("notifications.discord")
 
     def _format_content(self, kind: str, payload: dict) -> str:
-        lines = [f"**[{kind}]**"]
-        for k, v in payload.items():
-            if isinstance(v, float):
-                lines.append(f"- `{k}`: {v:.4f}")
-            else:
-                lines.append(f"- `{k}`: {v}")
-        body = "\n".join(lines)
+        if kind in CLOSE_KINDS:
+            body = self._format_trade_closed(kind, payload)
+        else:
+            lines = [f"**[{kind}]**"]
+            for k, v in payload.items():
+                if isinstance(v, float):
+                    lines.append(f"- `{k}`: {v:.4f}")
+                else:
+                    lines.append(f"- `{k}`: {v}")
+            body = "\n".join(lines)
         # Discord caps content at 2000 chars. Truncate aggressively rather
         # than risk a 400.
         if len(body) > 1900:
             body = body[:1897] + "..."
         return body
+
+    def _format_trade_closed(self, kind: str, payload: dict) -> str:
+        """Render a closed trade as a clear gain/loss message.
+
+        Falls back gracefully: any field that is missing is simply omitted,
+        so this stays safe even for sparse payloads.
+        """
+        result = str(payload.get("result", "")).upper()
+        symbol = payload.get("instrument") or payload.get("symbol") or "?"
+        direction = str(payload.get("direction", "")).lower()
+        net = payload.get("net_pnl")
+        return_pct = payload.get("return_pct")
+        entry = payload.get("entry_price")
+        exit_price = payload.get("exit_price")
+        qty = payload.get("quantity")
+        bars_held = payload.get("bars_held")
+        costs = payload.get("costs")
+        exit_reason = payload.get("exit_reason")
+
+        if result == "WIN":
+            emoji, verb = "🟢", "gained"
+        elif result == "LOSS":
+            emoji, verb = "🔴", "lost"
+        else:
+            emoji, verb = "⚪", "broke even"
+
+        header = f"{emoji} **Trade Closed — {result or 'DONE'}**"
+        if kind == "forced_flat":
+            header += " (end-of-day flatten)"
+        lines = [header]
+
+        # Headline the user actually cares about: how much did I make/lose?
+        if isinstance(net, (int, float)):
+            money = _fmt_signed_money(float(net))
+            pct = ""
+            if isinstance(return_pct, (int, float)):
+                pct = f" ({_fmt_signed_pct(float(return_pct))})"
+            if result == "BREAKEVEN":
+                lines.append(f"Flat — **{money}**{pct}")
+            else:
+                lines.append(f"You {verb} **{money}**{pct}")
+
+        # Instrument / direction / exit reason context.
+        ctx = [f"`{symbol}`"]
+        if direction:
+            ctx.append(direction)
+        if exit_reason:
+            ctx.append(f"exit: {exit_reason}")
+        lines.append(" · ".join(ctx))
+
+        # Trade mechanics: entry → exit, size, hold time, fees.
+        detail: list[str] = []
+        if isinstance(entry, (int, float)) and isinstance(exit_price, (int, float)):
+            detail.append(f"{entry:g} → {exit_price:g}")
+        if isinstance(qty, (int, float)):
+            detail.append(f"qty {qty:g}")
+        elif qty is not None:
+            detail.append(f"qty {qty}")
+        if bars_held is not None:
+            detail.append(f"{bars_held} bars")
+        if isinstance(costs, (int, float)) and costs:
+            detail.append(f"fees ${abs(float(costs)):,.2f}")
+        if detail:
+            lines.append(" · ".join(detail))
+
+        return "\n".join(lines)
 
     @staticmethod
     def _parse_retry_after(response: "httpx.Response") -> float:

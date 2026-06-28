@@ -154,9 +154,14 @@ def download_symbols(
     symbols: Optional[list[str]] = None,
     timeframe: str = "1m",
     days: int = 30,
+    dest_dir: Optional[Path] = None,
     http_client: Any = None,
 ) -> dict[str, str]:
-    """Download bars for each symbol into the historical data dir.
+    """Download bars for each symbol into ``dest_dir``.
+
+    ``dest_dir`` defaults to ``HISTORICAL_DATA_DIR`` (the long training
+    history). The live loop passes ``LIVE_DATA_DIR`` so its short refresh
+    never overwrites that history.
 
     Returns a map of symbol → result ("ok" or an error string). One
     symbol failing never aborts the others.
@@ -176,6 +181,7 @@ def download_symbols(
         http_client=http_client,
     )
     syms = symbols or list(settings.ENABLED_SYMBOLS)
+    out_dir = Path(dest_dir) if dest_dir is not None else Path(settings.HISTORICAL_DATA_DIR)
     end = datetime.now(tz=timezone.utc)
     start = end - timedelta(days=days)
     results: dict[str, str] = {}
@@ -183,7 +189,7 @@ def download_symbols(
         try:
             fetcher.write_csv(
                 sym,
-                historical_dir=Path(settings.HISTORICAL_DATA_DIR),
+                historical_dir=out_dir,
                 timeframe=timeframe,
                 start=start,
                 end=end,

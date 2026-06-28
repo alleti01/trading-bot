@@ -97,9 +97,22 @@ class SignalEngine:
                     strat.params.skip_close_minutes = skip_close
         return strategies
 
+    def _ohlcv_path(self, symbol: str) -> Optional[Path]:
+        """Prefer fresh live bars; fall back to the long training history."""
+        sym = symbol.upper()
+        live_dir = getattr(self.settings, "LIVE_DATA_DIR", None)
+        candidates = []
+        if live_dir is not None:
+            candidates.append(Path(live_dir) / sym / "1m.csv")
+        candidates.append(Path(self.settings.HISTORICAL_DATA_DIR) / sym / "1m.csv")
+        for path in candidates:
+            if path.exists():
+                return path
+        return None
+
     def _load_ohlcv(self, symbol: str) -> Optional[pd.DataFrame]:
-        path = Path(self.settings.HISTORICAL_DATA_DIR) / symbol.upper() / "1m.csv"
-        if not path.exists():
+        path = self._ohlcv_path(symbol)
+        if path is None:
             return None
         try:
             from data.csv_loader import load_ohlcv_csv

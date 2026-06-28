@@ -29,6 +29,38 @@ def _settings(monkeypatch, **overrides):
     return reload_settings()
 
 
+def test_signal_engine_prefers_live_over_historical(monkeypatch, tmp_path) -> None:
+    # When both live and historical bars exist, the engine reads the live copy.
+    settings = _settings(monkeypatch)
+    settings.HISTORICAL_DATA_DIR = tmp_path / "historical"
+    settings.LIVE_DATA_DIR = tmp_path / "live"
+    df = synthetic_ohlcv(n_bars=300, base_price=550.0)
+
+    hist = settings.HISTORICAL_DATA_DIR / "SPY" / "1m.csv"
+    hist.parent.mkdir(parents=True, exist_ok=True)
+    df.reset_index().rename(columns={"index": "timestamp"}).to_csv(hist, index=False)
+    live = settings.LIVE_DATA_DIR / "SPY" / "1m.csv"
+    live.parent.mkdir(parents=True, exist_ok=True)
+    df.reset_index().rename(columns={"index": "timestamp"}).to_csv(live, index=False)
+
+    eng = SignalEngine(settings)
+    assert eng._ohlcv_path("SPY") == live  # noqa: SLF001
+
+
+def test_signal_engine_falls_back_to_historical(monkeypatch, tmp_path) -> None:
+    # No live copy yet → engine falls back to the long training history.
+    settings = _settings(monkeypatch)
+    settings.HISTORICAL_DATA_DIR = tmp_path / "historical"
+    settings.LIVE_DATA_DIR = tmp_path / "live"
+    df = synthetic_ohlcv(n_bars=300, base_price=550.0)
+    hist = settings.HISTORICAL_DATA_DIR / "SPY" / "1m.csv"
+    hist.parent.mkdir(parents=True, exist_ok=True)
+    df.reset_index().rename(columns={"index": "timestamp"}).to_csv(hist, index=False)
+
+    eng = SignalEngine(settings)
+    assert eng._ohlcv_path("SPY") == hist  # noqa: SLF001
+
+
 def test_signal_none_when_no_data(monkeypatch) -> None:
     settings = _settings(monkeypatch)
     engine = SignalEngine(settings)

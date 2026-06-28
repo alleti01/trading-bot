@@ -259,6 +259,31 @@ class IntradayLoop:
             model_version=self.settings.WORKFLOW_MODEL_VERSION,
         )
 
+        # Options routing: SPY/QQQ (or whatever OPTIONS_ENABLED_UNDERLYINGS
+        # lists) become long calls/puts instead of share orders. Build one
+        # trader per scan and track which underlyings already hold an open
+        # option so we don't stack a second position on the same name.
+        from workflows.options_execution import build_options_trader, options_enabled_for
+
+        options_trader = None
+        option_underlyings_open: set[str] = set()
+        if self.settings.OPTIONS_ENABLED and not self.dry_run:
+            options_trader = build_options_trader(ctx, now=now)
+            if options_trader is not None:
+                # Manage open option positions first (profit target / stop /
+                # expiry / roll). The trader emits its own close/manage alerts.
+                try:
+                    options_trader.manage(now=now)
+                except Exception as e:  # noqa: BLE001
+                    self.log.warning("intraday.option_manage_failed", error=str(e))
+                try:
+                    option_underlyings_open = {
+                        p.underlying.upper()
+                        for p in options_trader.pm.positions.values()
+                    }
+                except Exception:  # noqa: BLE001
+                    option_underlyings_open = set()
+
         results: list[dict[str, Any]] = []
         broker_state = ctx.broker.pull_state(now=now)
         open_positions = max(
@@ -300,17 +325,64 @@ class IntradayLoop:
                 )
                 continue
 
+            route_options = options_enabled_for(ctx, sym)
+
             if self.dry_run:
-                results.append(
-                    {
-                        "symbol": sym,
-                        "action": "would_enter",
-                        "direction": signal.direction,
-                        "entry": signal.entry_price,
-                        "stop": signal.stop_price,
-                        "target": signal.target_price,
-                    }
-                )
+                if route_options:
+                    results.append(
+                        {
+                            "symbol": sym,
+                            "action": "would_enter_option",
+                            "underlying": sym,
+                            "option_type": "call" if signal.direction == "long" else "put",
+                        }
+                    )
+                else:
+                    results.append(
+                        {
+                            "symbol": sym,
+                            "action": "would_enter",
+                            "direction": signal.direction,
+                            "entry": signal.entry_price,
+                            "stop": signal.stop_price,
+                            "target": signal.target_price,
+                        }
+                    )
+                continue
+
+            # ---- Options underlyings → long call/put (defined risk) -------
+            if route_options:
+                if sym.upper() in option_underlyings_open:
+                    results.append({"symbol": sym, "action": "skip", "reason": "option_already_open"})
+                    continue
+                if options_trader is None:
+                    results.append({"symbol": sym, "action": "skip", "reason": "options_unavailable"})
+                    continue
+                try:
+                    res = options_trader.handle_signal(
+                        underlying=sym,
+                        direction=signal.direction,
+                        now=now,
+                        thesis=f"intraday {signal.direction} {sym} option ({signal.reason})",
+                    )
+                except Exception as e:  # noqa: BLE001
+                    self.log.warning("intraday.option_error", symbol=sym, error=str(e))
+                    res = {"status": "error", "reason": str(e)}
+                if res.get("status") == "opened":
+                    self._orders += 1
+                    self._trades_today += 1
+                    open_positions += 1
+                    option_underlyings_open.add(sym.upper())
+                    results.append(
+                        {"symbol": sym, "action": "enter_option",
+                         "direction": signal.direction, "status": "opened"}
+                    )
+                    # OptionsTrader already emits the options.opened alert.
+                else:
+                    results.append(
+                        {"symbol": sym, "action": "skip",
+                         "reason": f"option_{res.get('status', '?')}:{res.get('reason', '')}"}
+                    )
                 continue
 
             qty = self._size_position(sym, signal)
@@ -333,6 +405,13 @@ class IntradayLoop:
                     {"symbol": sym, "action": "enter", "direction": signal.direction,
                      "order_id": entry.order_id if entry else None}
                 )
+                # In strategy-only mode there is no model probability; show a
+                # clear label instead of a confusing "None" in alerts.
+                conf_display = (
+                    round(float(signal.confidence), 4)
+                    if signal.confidence is not None
+                    else "strategy-only"
+                )
                 self._notify_safe(
                     "trade.opened",
                     instrument=sym,
@@ -340,7 +419,7 @@ class IntradayLoop:
                     entry_price=signal.entry_price,
                     stop_price=signal.stop_price,
                     target_price=signal.target_price,
-                    confidence=signal.confidence,
+                    confidence=conf_display,
                     source="workflow.intraday",
                 )
             else:
@@ -388,7 +467,14 @@ class IntradayLoop:
         try:
             from data.alpaca_bars import download_symbols
 
-            download_symbols(self.settings, symbols=symbols, timeframe="1m", days=30)
+            # Write to LIVE_DATA_DIR — never the long training history.
+            download_symbols(
+                self.settings,
+                symbols=symbols,
+                timeframe="1m",
+                days=30,
+                dest_dir=self.settings.LIVE_DATA_DIR,
+            )
         except Exception as e:  # noqa: BLE001
             self.log.warning("intraday.data_refresh_failed", error=str(e))
 

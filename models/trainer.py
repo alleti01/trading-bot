@@ -45,7 +45,7 @@ from sklearn.preprocessing import StandardScaler
 from app.logging_config import get_logger
 from validation.walk_forward import WalkForwardSplit
 
-ModelKind = Literal["logreg", "lightgbm"]
+ModelKind = Literal["logreg", "lightgbm", "hist_gbm"]
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +88,10 @@ def has_lightgbm() -> bool:
     try:
         importlib.import_module("lightgbm")
         return True
-    except ImportError:
+    except Exception:
+        # Not just ImportError: a present-but-unloadable install (e.g. missing
+        # libomp on macOS) raises OSError. Treat any failure as "unavailable"
+        # so trainer/CLI fall back cleanly instead of crashing.
         return False
 
 
@@ -101,6 +104,18 @@ def _default_params(model_kind: ModelKind) -> dict[str, Any]:
             "learning_rate": 0.05,
             "num_leaves": 31,
             "verbose": -1,
+        }
+    if model_kind == "hist_gbm":
+        # sklearn gradient-boosted trees — captures non-linear effects
+        # (e.g. the time-of-day pattern) that logreg can't, with no
+        # external/system deps. Regularized to avoid overfitting the
+        # thin intraday signal.
+        return {
+            "max_depth": 4,
+            "learning_rate": 0.05,
+            "max_iter": 300,
+            "min_samples_leaf": 50,
+            "l2_regularization": 1.0,
         }
     return {}
 
@@ -119,6 +134,10 @@ def _make_estimator(model_kind: ModelKind, params: dict[str, Any]) -> Any:
         import lightgbm as lgb
 
         return lgb.LGBMClassifier(**params)
+    if model_kind == "hist_gbm":
+        from sklearn.ensemble import HistGradientBoostingClassifier
+
+        return HistGradientBoostingClassifier(**params)
     raise ValueError(f"Unknown model_kind: {model_kind}")
 
 
@@ -304,27 +323,51 @@ def train(
             params=params,
         )
 
-    # 2. Final fit on train, calibrate on val
-    base = _make_estimator(model_kind, params)
-    base.fit(X_tr, y_train)
-
-    # Pick calibration method by val size (isotonic needs lots of samples to behave).
-    cal_method = "isotonic" if len(X_v) >= 1000 else "sigmoid"
-    log.info("calibration.method", method=cal_method, n_val=int(len(X_v)))
-
-    # sklearn 1.6+ replaced ``cv="prefit"`` with the FrozenEstimator wrapper.
-    # Wrapping a fitted estimator in FrozenEstimator tells CalibratedClassifierCV
-    # not to refit it; the cv parameter then only applies to the calibration split
-    # over X_v itself.
-    if _HAVE_FROZEN_ESTIMATOR:
-        cv_folds = 2 if len(X_v) >= 4 else 2  # min cv must be 2; sigmoid handles tiny folds
-        calibrator = CalibratedClassifierCV(
-            FrozenEstimator(base), method=cal_method, cv=cv_folds
+    # 2. Fit + calibrate.
+    #
+    # Tree models (gradient boosting) produce sharply peaked scores. If you
+    # pre-fit them on the train split and then calibrate on a small in-sample-ish
+    # val slice, the calibrator collapses every prediction into a narrow band
+    # (~0.31-0.37 here), which destroys any usable probability threshold even
+    # though the model still *ranks* setups correctly. Instead, calibrate these
+    # models with internal cross-validation over the combined train+val data so
+    # the calibrator learns from out-of-fold predictions across the full
+    # distribution. The held-out test split is owned by the caller and is never
+    # part of (X_train, X_val), so this does not leak into reported test metrics.
+    _TREE_KINDS = {"lightgbm", "hist_gbm"}
+    if model_kind in _TREE_KINDS:
+        X_fit = pd.concat([X_tr, X_v])
+        y_fit = pd.concat([y_train, y_val])
+        cal_method = "isotonic" if len(X_fit) >= 2000 else "sigmoid"
+        log.info(
+            "calibration.method",
+            method=cal_method,
+            strategy="cv_combined",
+            n_fit=int(len(X_fit)),
         )
-        calibrator.fit(X_v, y_val)
-    else:  # pragma: no cover - older sklearn
-        calibrator = CalibratedClassifierCV(base, method=cal_method, cv="prefit")
-        calibrator.fit(X_v, y_val)
+        calibrator = CalibratedClassifierCV(
+            _make_estimator(model_kind, params), method=cal_method, cv=3
+        )
+        calibrator.fit(X_fit, y_fit)
+    else:
+        # Linear models calibrate cleanly with the prefit + val-slice approach.
+        base = _make_estimator(model_kind, params)
+        base.fit(X_tr, y_train)
+
+        # Pick calibration method by val size (isotonic needs lots of samples).
+        cal_method = "isotonic" if len(X_v) >= 1000 else "sigmoid"
+        log.info("calibration.method", method=cal_method, n_val=int(len(X_v)))
+
+        # sklearn 1.6+ replaced ``cv="prefit"`` with the FrozenEstimator wrapper.
+        if _HAVE_FROZEN_ESTIMATOR:
+            cv_folds = 2  # min cv must be 2; sigmoid handles tiny folds
+            calibrator = CalibratedClassifierCV(
+                FrozenEstimator(base), method=cal_method, cv=cv_folds
+            )
+            calibrator.fit(X_v, y_val)
+        else:  # pragma: no cover - older sklearn
+            calibrator = CalibratedClassifierCV(base, method=cal_method, cv="prefit")
+            calibrator.fit(X_v, y_val)
 
     # 3. Aggregate metrics on val
     val_proba = calibrator.predict_proba(X_v)[:, 1]

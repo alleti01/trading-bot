@@ -176,9 +176,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-kind",
-        choices=["logreg", "lightgbm"],
+        choices=["logreg", "lightgbm", "hist_gbm"],
         default="logreg",
-        help="Trainer to use for MODE=TRAIN (default: logreg).",
+        help="Trainer for MODE=TRAIN / --train-universe (logreg | hist_gbm | lightgbm).",
     )
     parser.add_argument(
         "--train-frac",

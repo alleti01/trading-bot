@@ -54,6 +54,7 @@ from execution.base import Order
 from execution.paper_executor import KillSwitchActive, PaperExecutor
 from features.feature_builder import FEATURE_COLUMNS
 from models.predictor import Predictor
+from notifications.trade_events import build_trade_closed_payload
 from risk.kill_switch import KillSwitch
 from risk.position_sizing import size_position
 from risk.risk_engine import RiskConfig, RiskDecision, evaluate
@@ -460,9 +461,7 @@ class WebhookProcessor:
 
         self._safe_notify(
             "webhook.closed",
-            symbol=record.instrument,
-            direction=record.direction,
-            net_pnl=round(float(record.net_pnl), 2),
+            **build_trade_closed_payload(record, symbol_key="symbol"),
         )
         return WebhookResponse(
             status="closed",

@@ -388,7 +388,13 @@ class Settings(BaseSettings):
 
     # ---- Filesystem layout --------------------------------------------
     DATA_DIR: Path = Path("./data")
+    # Long history for training/backtests. Populated by manual --download-data
+    # and never auto-overwritten by the live loop.
     HISTORICAL_DATA_DIR: Path = Path("./data/historical")
+    # Recent bars the intraday loop refreshes each scan. Kept separate so the
+    # loop's short (30-day) refresh can't clobber the long training history.
+    # The signal engine reads here first, then falls back to HISTORICAL_DATA_DIR.
+    LIVE_DATA_DIR: Path = Path("./data/live")
     MODELS_DIR: Path = Path("./data/models")
     REPORTS_DIR: Path = Path("./data/reports")
     LOGS_DIR: Path = Path("./logs")

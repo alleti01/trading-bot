@@ -152,6 +152,25 @@ class OptionsPositionManager:
             return None
         contract = parse_occ_symbol(occ_symbol)
         result = self.executor.close_contract(contract=contract, qty=pos.qty)
+
+        # Realised PnL: prefer the broker fill price, otherwise the last
+        # refreshed mid (which is what triggered the close in the first
+        # place). Stays None if we have no price at all, so the caller can
+        # skip the dollar figure rather than report a wrong one.
+        exit_price = result.limit_price
+        if exit_price is None:
+            exit_price = pos.current_price
+        realized_pnl: Optional[float] = None
+        realized_pnl_pct: Optional[float] = None
+        if exit_price is not None:
+            realized_pnl = round(
+                (float(exit_price) - pos.entry_price) * 100.0 * pos.qty, 2
+            )
+            if pos.entry_price:
+                realized_pnl_pct = round(
+                    (float(exit_price) - pos.entry_price) / pos.entry_price * 100.0, 2
+                )
+
         self.positions.pop(occ_symbol, None)
         self.save()
         self.log.info(
@@ -159,8 +178,20 @@ class OptionsPositionManager:
             occ=occ_symbol,
             reason=reason,
             order_id=result.order_id,
+            realized_pnl=realized_pnl,
         )
-        return {"reason": reason, "order": result.to_payload()}
+        return {
+            "reason": reason,
+            "occ_symbol": occ_symbol,
+            "underlying": pos.underlying,
+            "option_type": pos.option_type,
+            "qty": pos.qty,
+            "entry_price": pos.entry_price,
+            "exit_price": float(exit_price) if exit_price is not None else None,
+            "realized_pnl": realized_pnl,
+            "realized_pnl_pct": realized_pnl_pct,
+            "order": result.to_payload(),
+        }
 
     # ------------------------------------------------------------------
     # Management cycle (called by midday / scheduler workflows)

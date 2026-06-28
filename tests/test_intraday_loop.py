@@ -137,6 +137,58 @@ def test_scan_once_places_orders_when_autonomous(monkeypatch, tmp_path) -> None:
     assert summary["entered"] >= 1
 
 
+def test_scan_once_dry_run_routes_options_for_underlyings(monkeypatch, tmp_path) -> None:
+    settings = _settings(
+        monkeypatch, tmp_path,
+        OPTIONS_ENABLED="true",
+        OPTIONS_ENABLED_UNDERLYINGS="SPY,QQQ",
+        WORKFLOW_DYNAMIC_UNIVERSE="false",
+    )
+    init_db()
+    from unittest.mock import patch
+
+    from workflows.intraday_loop import IntradayLoop
+
+    loop = IntradayLoop(settings, dry_run=True)
+    now = datetime(2026, 6, 17, 14, 30, tzinfo=timezone.utc)
+    with patch(
+        "workflows.signal_engine.SignalEngine.generate_signal",
+        new=lambda self, sym: make_signal(sym, price=100.0),
+    ):
+        summary = loop.scan_once(now=now)
+    actions = {r["action"] for r in summary["results"]}
+    assert "would_enter_option" in actions   # SPY/QQQ → options
+    assert "would_enter" not in actions       # not equity shares
+    assert "enter_option" not in actions      # dry run never places orders
+
+
+def test_scan_once_live_routes_enabled_underlyings_to_options(monkeypatch, tmp_path) -> None:
+    settings = _settings(
+        monkeypatch, tmp_path,
+        OPTIONS_ENABLED="true",
+        OPTIONS_STRATEGY="atm_directional",
+        OPTIONS_ENABLED_UNDERLYINGS="SPY,QQQ",
+        OPTIONS_MAX_PREMIUM_PER_TRADE="100000",  # don't let premium cap block the test
+        OPTIONS_STATE_PATH=str(tmp_path / "opt_positions.json"),
+        WORKFLOW_DYNAMIC_UNIVERSE="false",
+    )
+    init_db()
+    from unittest.mock import patch
+
+    from workflows.intraday_loop import IntradayLoop
+
+    loop = IntradayLoop(settings, dry_run=False)
+    now = datetime(2026, 6, 17, 14, 30, tzinfo=timezone.utc)
+    with patch(
+        "workflows.signal_engine.SignalEngine.generate_signal",
+        new=lambda self, sym: make_signal(sym, price=100.0),
+    ):
+        summary = loop.scan_once(now=now)
+    actions = [r["action"] for r in summary["results"]]
+    assert "enter_option" in actions   # SPY/QQQ opened as options
+    assert "enter" not in actions       # never an equity bracket for these names
+
+
 def test_run_forever_skips_scan_outside_window(monkeypatch, tmp_path) -> None:
     # Outside the trading window → no scans, loop exits via max_cycles.
     settings = _settings(monkeypatch, tmp_path, WORKFLOW_SCAN_INTERVAL_MINUTES="1")

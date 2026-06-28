@@ -10,7 +10,8 @@ Discord.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import json
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -18,6 +19,61 @@ from app.logging_config import get_logger
 from config.settings import Settings
 
 _log = get_logger("reports.live_paper")
+
+
+def _open_options_summary(settings: Settings, now: datetime) -> dict[str, Any]:
+    """Summarize open option positions from the manager's state file.
+
+    Reads the JSON directly (no broker/executor/network) so it is safe to
+    call from any report path. Realized option P&L is already reflected in
+    the account's day P&L; this surfaces the *open* option book separately.
+    """
+    summary: dict[str, Any] = {"enabled": True, "n_open": 0, "open": []}
+    state_path = Path(getattr(settings, "OPTIONS_STATE_PATH", "data/options/positions.json"))
+    if not state_path.exists():
+        return summary
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        _log.warning("live_paper_report.options_state_unreadable", error=str(e))
+        return summary
+
+    rows: list[dict[str, Any]] = []
+    total_upnl = 0.0
+    have_upnl = False
+    for occ, pos in (data.get("positions") or {}).items():
+        entry = float(pos.get("entry_price") or 0.0)
+        qty = int(pos.get("qty") or 0)
+        current = pos.get("current_price")
+        upnl = None
+        upnl_pct = None
+        if current is not None:
+            upnl = round((float(current) - entry) * 100.0 * qty, 2)
+            upnl_pct = round(((float(current) - entry) / entry * 100.0), 2) if entry else None
+            total_upnl += upnl
+            have_upnl = True
+        dte = None
+        try:
+            dte = (date.fromisoformat(str(pos.get("expiry"))) - now.date()).days
+        except Exception:  # noqa: BLE001
+            pass
+        rows.append(
+            {
+                "occ": occ,
+                "underlying": pos.get("underlying", ""),
+                "type": pos.get("option_type", ""),
+                "qty": qty,
+                "entry_price": entry,
+                "current_price": current,
+                "unrealized_pnl": upnl,
+                "unrealized_pnl_pct": upnl_pct,
+                "dte": dte,
+            }
+        )
+    summary["open"] = rows
+    summary["n_open"] = len(rows)
+    summary["unrealized_pnl"] = round(total_upnl, 2) if have_upnl else None
+    return summary
 
 
 def build_live_paper_report(
@@ -71,6 +127,11 @@ def build_live_paper_report(
         payload["error"] = str(e)
         _log.error("live_paper_report.broker_failed", error=str(e))
 
+    # Options book (independent of broker call so it shows even if the
+    # broker snapshot failed). Realized option P&L is part of day P&L above.
+    if getattr(settings, "OPTIONS_ENABLED", False):
+        payload["options"] = _open_options_summary(settings, now)
+
     out_dir = out_dir or (Path(settings.REPORTS_DIR) / "live_paper")
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"live_{now.strftime('%Y-%m-%d')}.md"
@@ -110,20 +171,50 @@ def _render_markdown(p: dict[str, Any]) -> str:
     lines += ["", f"## Working orders ({p.get('n_open_orders', 0)})"]
     for o in p.get("open_orders", []):
         lines.append(f"- {o['symbol']} {o['side']} {o['qty']} ({o['type']})")
+
+    opts = p.get("options")
+    if opts is not None:
+        upnl = opts.get("unrealized_pnl")
+        upnl_txt = f"  (unrealized ${upnl:,.2f})" if upnl is not None else ""
+        lines += ["", f"## Open options ({opts.get('n_open', 0)}){upnl_txt}"]
+        for o in opts.get("open", []):
+            up = o.get("unrealized_pnl")
+            up_txt = f"uPnL ${up:,.2f}" if up is not None else "uPnL n/a"
+            dte = o.get("dte")
+            dte_txt = f"{dte}DTE" if dte is not None else "?DTE"
+            lines.append(
+                f"- {o['underlying']} {o['type']} x{o['qty']} "
+                f"@ ${o['entry_price']:.2f} ({dte_txt}, {up_txt})"
+            )
     return "\n".join(lines)
+
+
+def _options_line(payload: dict[str, Any]) -> Optional[str]:
+    opts = payload.get("options")
+    if not opts:
+        return None
+    upnl = opts.get("unrealized_pnl")
+    upnl_txt = f" | uPnL ${upnl:,.2f}" if upnl is not None else ""
+    return f"Open options: {opts.get('n_open', 0)}{upnl_txt}"
 
 
 def discord_summary_lines(payload: dict[str, Any]) -> list[str]:
     """≤10-line Discord-friendly summary of the live paper snapshot."""
+    opt_line = _options_line(payload)
     if not payload.get("ok"):
-        return [f"Paper report error: {payload.get('error', 'unknown')}"]
+        out = [f"Paper report error: {payload.get('error', 'unknown')}"]
+        if opt_line:
+            out.append(opt_line)
+        return out
     acct = payload.get("account", {})
     lines = [
         f"Paper account ({payload.get('provider')})",
         f"Equity ${acct.get('equity', 0):,.0f} | Day P&L ${acct.get('day_pnl', 0):,.2f}",
         f"Open positions: {payload.get('n_positions', 0)} | Working orders: {payload.get('n_open_orders', 0)}",
     ]
-    for pos in payload.get("positions", [])[:5]:
+    if opt_line:
+        lines.append(opt_line)
+    for pos in payload.get("positions", [])[:4]:
         lines.append(
             f"  {pos['symbol']} {pos['direction']} {pos['qty']} "
             f"(uPnL ${pos.get('unrealized_pnl', 0):.2f})"
