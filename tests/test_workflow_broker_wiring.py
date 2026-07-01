@@ -92,3 +92,35 @@ def test_market_open_uses_integration_broker_for_entry(
     assert result.payload.get("actions_taken", 0) >= 1
     mock_broker.reconcile.assert_called()
     mock_broker.place_bracket_order.assert_called()
+
+
+def test_bracket_rejection_skips_symbol_without_blocking_all() -> None:
+    # A per-order rejection (e.g. Alpaca 422) must NOT halt the whole cycle —
+    # it skips this symbol so the loop keeps scanning the rest of the universe.
+    from integrations.broker_base import BrokerError
+    from workflows.order_execution import execute_entry_with_stops
+
+    ctx = MagicMock()
+    ctx.dry_run = False
+    ctx.entries_blocked = False
+    broker = MagicMock()
+    broker.validate_order.return_value = MagicMock(valid=True)
+    broker.place_bracket_order.side_effect = BrokerError(
+        "Alpaca POST /v2/orders failed status=422: potential wash trade detected"
+    )
+    ctx.order_broker = broker
+
+    ok, entry, protective = execute_entry_with_stops(
+        ctx,
+        symbol="MSFT",
+        side="short",
+        quantity=67,
+        entry_price=372.51,
+        stop_price=373.07,
+        target_price=371.39,
+        thesis="test",
+    )
+
+    assert ok is False
+    assert ctx.entries_blocked is False  # other symbols keep trading
+    ctx.notifier.notify.assert_called()

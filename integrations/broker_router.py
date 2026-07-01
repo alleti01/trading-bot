@@ -58,6 +58,26 @@ class BrokerRouter:
     def execution_mode(self) -> str:
         return str(self.settings.WORKFLOW_EXECUTION_MODE).upper()
 
+    def _tradable_symbols(self) -> list[str]:
+        """Symbols the broker is allowed to trade.
+
+        Just ``ENABLED_SYMBOLS`` normally, but when the loop scans a dynamic
+        universe the broker must also accept every vetted allowlist name —
+        otherwise a valid NVDA/AMD/QCOM signal is rejected as "not enabled"
+        even though the loop deliberately scanned it. The allowlist is the
+        same safety boundary the scan universe uses.
+        """
+        symbols = list(self.settings.ENABLED_SYMBOLS)
+        if getattr(self.settings, "WORKFLOW_DYNAMIC_UNIVERSE", False):
+            from config.equity_allowlist import LIQUID_EQUITY_ALLOWLIST
+
+            seen = {s.upper() for s in symbols}
+            for s in sorted(LIQUID_EQUITY_ALLOWLIST):
+                if s not in seen:
+                    symbols.append(s)
+                    seen.add(s)
+        return symbols
+
     def is_live_locked(self) -> bool:
         return self.execution_mode() == "LIVE"
 
@@ -75,7 +95,7 @@ class BrokerRouter:
                 provider="mock",
                 reason="dry_run_forces_mock",
             )
-            return MockBroker(enabled_symbols=list(self.settings.ENABLED_SYMBOLS))
+            return MockBroker(enabled_symbols=self._tradable_symbols())
 
         provider = self.settings.BROKER_PROVIDER
         if provider not in _SUPPORTED_PROVIDERS:
@@ -86,7 +106,7 @@ class BrokerRouter:
 
         if provider == "mock":
             self.log.info("broker.router_select", mode=mode, provider="mock")
-            return MockBroker(enabled_symbols=list(self.settings.ENABLED_SYMBOLS))
+            return MockBroker(enabled_symbols=self._tradable_symbols())
 
         if provider == "alpaca":
             return self._build_alpaca(mode)
@@ -109,7 +129,7 @@ class BrokerRouter:
             if self.settings.ALPACA_SECRET_KEY
             else None
         )
-        symbols = enabled_symbols_override or list(self.settings.ENABLED_SYMBOLS)
+        symbols = enabled_symbols_override or self._tradable_symbols()
         try:
             client = AlpacaPaperClient(
                 api_key=api_key,
@@ -137,7 +157,7 @@ class BrokerRouter:
     def _build_tradovate(
         self, mode: str, *, enabled_symbols_override: Optional[list[str]] = None
     ) -> BaseBroker:
-        symbols = enabled_symbols_override or list(self.settings.ENABLED_SYMBOLS)
+        symbols = enabled_symbols_override or self._tradable_symbols()
         try:
             client = TradovateDemoClient(
                 base_url=self.settings.TRADOVATE_BASE_URL,

@@ -64,6 +64,11 @@ class IntradayLoop:
         self._trades_today = 0
         self._halted_today = False
         self._halt_reason = ""
+        # Open equity positions seen on the previous reconcile, keyed by
+        # symbol. Used to detect positions that closed server-side (a
+        # bracket take-profit / stop-loss fill) between scans so we can
+        # report the realised P&L — the loop never sees those closes live.
+        self._tracked_positions: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Daily risk + reconciliation helpers
@@ -145,19 +150,131 @@ class IntradayLoop:
             sym = str(p.get("symbol", "")).upper()
             if not sym:
                 continue
+            entry_price = float(p.get("average_price", 0.0) or 0.0)
+            qty = abs(float(p.get("quantity", 0.0) or 0.0))
+            direction = str(p.get("direction", "long") or "long")
             try:
                 result = broker.close_position(symbol=sym)
-                if getattr(result, "success", False):
-                    closed += 1
-                    self._notify_safe(
-                        "trade.closed", instrument=sym, reason=reason,
-                        source="workflow.intraday",
-                    )
             except BrokerError as e:
                 self.log.warning("intraday.flatten_failed", symbol=sym, error=str(e))
+                continue
+            if getattr(result, "success", False):
+                closed += 1
+                # Stop tracking so the reconcile diff next cycle doesn't
+                # re-report this same close.
+                self._tracked_positions.pop(sym, None)
+                self._emit_close(
+                    broker,
+                    symbol=sym,
+                    direction=direction,
+                    entry_price=entry_price,
+                    quantity=qty,
+                    reason=reason,
+                )
         if closed:
             self.log.info("intraday.flattened", closed=closed, reason=reason)
         return closed
+
+    def _detect_and_notify_closes(self, broker, reconcile: dict) -> None:
+        """Diff open positions vs. last cycle; report any that closed.
+
+        Bracket take-profit / stop-loss orders fill on the broker, so the
+        loop only learns a position closed by noticing it vanished from the
+        reconcile snapshot. For each vanished symbol we look up the closing
+        fill and send a ``trade.closed`` alert with realised P&L.
+        """
+        current: dict[str, dict[str, Any]] = {}
+        for p in reconcile.get("positions", []) or []:
+            sym = str(p.get("symbol", "")).upper()
+            if not sym:
+                continue
+            current[sym] = {
+                "entry_price": float(p.get("average_price", 0.0) or 0.0),
+                "quantity": abs(float(p.get("quantity", 0.0) or 0.0)),
+                "direction": str(p.get("direction", "long") or "long"),
+            }
+
+        working = {
+            str(o.get("symbol", "")).upper()
+            for o in (reconcile.get("orders", []) or [])
+            if o.get("symbol")
+        }
+
+        for sym, info in list(self._tracked_positions.items()):
+            if sym in current:
+                continue  # still open
+            if sym in working:
+                continue  # a leg is still pending — wait for it to settle
+            self._emit_close(
+                broker,
+                symbol=sym,
+                direction=str(info.get("direction", "long")),
+                entry_price=float(info.get("entry_price", 0.0) or 0.0),
+                quantity=float(info.get("quantity", 0.0) or 0.0),
+                reason="",  # unknown; resolved from the closing order type
+            )
+
+        self._tracked_positions = current
+
+    def _emit_close(
+        self,
+        broker,
+        *,
+        symbol: str,
+        direction: str,
+        entry_price: float,
+        quantity: float,
+        reason: str,
+    ) -> None:
+        """Send a rich ``trade.closed`` alert with realised P&L when known."""
+        from notifications.trade_events import classify_result
+
+        exit_side = "sell" if direction == "long" else "buy"
+        exit_price: Optional[float] = None
+        exit_qty = quantity
+        resolved_reason = reason
+
+        try:
+            fill = broker.get_last_exit_fill(symbol=symbol, exit_side=exit_side)
+        except Exception as e:  # noqa: BLE001
+            fill = None
+            self.log.warning("intraday.exit_fill_lookup_failed", symbol=symbol, error=str(e))
+
+        if fill is not None:
+            exit_price = float(fill.price)
+            if fill.quantity:
+                exit_qty = float(fill.quantity)
+            if not resolved_reason:
+                resolved_reason = fill.exit_kind
+
+        # Without an exit price (or a usable entry) we can't compute a
+        # trustworthy dollar figure — still tell the user it closed.
+        if exit_price is None or entry_price <= 0 or exit_qty <= 0:
+            self._notify_safe(
+                "trade.closed",
+                instrument=symbol,
+                direction=direction,
+                exit_reason=resolved_reason or "closed",
+                source="workflow.intraday",
+            )
+            return
+
+        sign = 1.0 if direction == "long" else -1.0
+        net_pnl = round(sign * (exit_price - entry_price) * exit_qty, 2)
+        return_pct = round(sign * (exit_price - entry_price) / entry_price * 100.0, 2)
+        self._notify_safe(
+            "trade.closed",
+            instrument=symbol,
+            direction=direction,
+            result=classify_result(net_pnl),
+            exit_reason=resolved_reason or "closed",
+            net_pnl=net_pnl,
+            return_pct=return_pct,
+            entry_price=round(entry_price, 4),
+            exit_price=round(exit_price, 4),
+            quantity=exit_qty,
+            source="workflow.intraday",
+        )
 
     # ------------------------------------------------------------------
     # Universe
@@ -230,6 +347,11 @@ class IntradayLoop:
         order_broker = resolve_order_broker(ctx)
         if order_broker is not None:
             reconcile_info = prepare_broker(ctx)
+
+        # Report any position that closed server-side (bracket TP/SL) since
+        # the last scan — with realised P&L — before we touch positions.
+        if order_broker is not None and not self.dry_run:
+            self._detect_and_notify_closes(order_broker, reconcile_info)
 
         # ---- Daily risk gate (deterministic, applies before any entry) ---
         risk_block = False
@@ -500,13 +622,20 @@ class IntradayLoop:
             dry_run=self.dry_run,
             execution_mode=self.settings.WORKFLOW_EXECUTION_MODE,
         )
+        if self.settings.OPTIONS_ENABLED:
+            opts_msg = (
+                f" | options ON ({self.settings.OPTIONS_STRATEGY} on "
+                f"{self.settings.OPTIONS_ENABLED_UNDERLYINGS})"
+            )
+        else:
+            opts_msg = " | options OFF"
         self._notify_safe(
             "system.info",
             source="workflow.intraday",
             message=(
                 f"Intraday loop started ({self.settings.WORKFLOW_EXECUTION_MODE}, "
                 f"every {self.settings.WORKFLOW_SCAN_INTERVAL_MINUTES}m, "
-                f"long_only={self.settings.WORKFLOW_LONG_ONLY})"
+                f"long_only={self.settings.WORKFLOW_LONG_ONLY}){opts_msg}"
             ),
         )
         cycles = 0

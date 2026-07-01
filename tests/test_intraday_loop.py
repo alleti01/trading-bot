@@ -218,6 +218,139 @@ def test_run_forever_scans_inside_window(monkeypatch, tmp_path) -> None:
     assert loop._scans == 2  # inside window: scanned each cycle
 
 
+# ---------------------------------------------------------------------------
+# Close detection + realised P&L notifications
+# ---------------------------------------------------------------------------
+class _CapturingNotifier:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def notify(self, kind: str, **payload) -> None:
+        self.calls.append((kind, payload))
+
+
+class _FakeExitBroker:
+    """Minimal broker stub exposing get_last_exit_fill for close tests."""
+
+    def __init__(self, fills=None) -> None:
+        from integrations.broker_base import ExitFill
+
+        self._fills = fills or {}
+        self._ExitFill = ExitFill
+        self.closed: list[str] = []
+
+    def get_last_exit_fill(self, *, symbol, exit_side):
+        fill = self._fills.get(symbol.upper())
+        if fill is not None and fill.side == exit_side:
+            return fill
+        return None
+
+    def close_position(self, *, symbol):
+        from integrations.broker_base import OrderResult
+
+        self.closed.append(symbol.upper())
+        return OrderResult(
+            success=True, simulated=True, order_id="x", symbol=symbol.upper(),
+            side="sell", quantity=0.0, order_type="market", status="filled",
+        )
+
+
+def test_detect_close_reports_realized_pnl_win(monkeypatch, tmp_path) -> None:
+    from integrations.broker_base import ExitFill
+    from workflows.intraday_loop import IntradayLoop
+
+    settings = _settings(monkeypatch, tmp_path)
+    loop = IntradayLoop(settings, dry_run=False)
+    note = _CapturingNotifier()
+    loop.notifier = note  # type: ignore[assignment]
+
+    # Cycle 1: AAPL is open (entry 100, 10 shares long).
+    recon1 = {"positions": [
+        {"symbol": "AAPL", "average_price": 100.0, "quantity": 10, "direction": "long"}
+    ], "orders": []}
+    broker = _FakeExitBroker()
+    loop._detect_and_notify_closes(broker, recon1)
+    assert note.calls == []  # nothing closed yet
+
+    # Cycle 2: AAPL gone; its take-profit filled at 105 → +$50 win.
+    broker._fills["AAPL"] = ExitFill(
+        symbol="AAPL", price=105.0, quantity=10, side="sell", exit_kind="take_profit"
+    )
+    loop._detect_and_notify_closes(broker, {"positions": [], "orders": []})
+
+    assert len(note.calls) == 1
+    kind, payload = note.calls[0]
+    assert kind == "trade.closed"
+    assert payload["net_pnl"] == 50.0
+    assert payload["result"] == "WIN"
+    assert payload["exit_reason"] == "take_profit"
+    assert payload["entry_price"] == 100.0
+    assert payload["exit_price"] == 105.0
+
+
+def test_detect_close_reports_realized_pnl_loss(monkeypatch, tmp_path) -> None:
+    from integrations.broker_base import ExitFill
+    from workflows.intraday_loop import IntradayLoop
+
+    settings = _settings(monkeypatch, tmp_path)
+    loop = IntradayLoop(settings, dry_run=False)
+    note = _CapturingNotifier()
+    loop.notifier = note  # type: ignore[assignment]
+
+    loop._tracked_positions = {
+        "MSFT": {"entry_price": 400.0, "quantity": 5, "direction": "long"}
+    }
+    broker = _FakeExitBroker(fills={
+        "MSFT": ExitFill(
+            symbol="MSFT", price=396.0, quantity=5, side="sell", exit_kind="stop_loss"
+        )
+    })
+    loop._detect_and_notify_closes(broker, {"positions": [], "orders": []})
+
+    assert len(note.calls) == 1
+    _, payload = note.calls[0]
+    assert payload["net_pnl"] == -20.0
+    assert payload["result"] == "LOSS"
+    assert payload["exit_reason"] == "stop_loss"
+
+
+def test_detect_close_still_open_no_notification(monkeypatch, tmp_path) -> None:
+    from workflows.intraday_loop import IntradayLoop
+
+    settings = _settings(monkeypatch, tmp_path)
+    loop = IntradayLoop(settings, dry_run=False)
+    note = _CapturingNotifier()
+    loop.notifier = note  # type: ignore[assignment]
+
+    loop._tracked_positions = {
+        "AAPL": {"entry_price": 100.0, "quantity": 10, "direction": "long"}
+    }
+    recon = {"positions": [
+        {"symbol": "AAPL", "average_price": 100.0, "quantity": 10, "direction": "long"}
+    ], "orders": []}
+    loop._detect_and_notify_closes(broker=_FakeExitBroker(), reconcile=recon)
+    assert note.calls == []  # still open → silent
+
+
+def test_detect_close_without_fill_still_notifies(monkeypatch, tmp_path) -> None:
+    from workflows.intraday_loop import IntradayLoop
+
+    settings = _settings(monkeypatch, tmp_path)
+    loop = IntradayLoop(settings, dry_run=False)
+    note = _CapturingNotifier()
+    loop.notifier = note  # type: ignore[assignment]
+
+    loop._tracked_positions = {
+        "AAPL": {"entry_price": 100.0, "quantity": 10, "direction": "long"}
+    }
+    # Broker returns no exit fill → we can't compute P&L but must still alert.
+    loop._detect_and_notify_closes(broker=_FakeExitBroker(), reconcile={"positions": [], "orders": []})
+    assert len(note.calls) == 1
+    kind, payload = note.calls[0]
+    assert kind == "trade.closed"
+    assert "net_pnl" not in payload  # no dollar figure without a fill
+
+
 def test_live_mode_scan_refused(monkeypatch, tmp_path) -> None:
     settings = _settings(monkeypatch, tmp_path, WORKFLOW_EXECUTION_MODE="LIVE")
     init_db()

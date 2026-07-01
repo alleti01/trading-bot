@@ -27,6 +27,7 @@ from integrations.broker_base import (
     AccountState,
     BaseBroker,
     BrokerError,
+    ExitFill,
     FUTURES_SYMBOLS,
     OpenOrder,
     OrderResult,
@@ -67,6 +68,8 @@ class AlpacaPaperClient(BaseBroker):
         timeout_seconds: float = 15.0,
         http_client: Optional[httpx.Client] = None,
         data_url: str = _DATA_URL,
+        max_retries: int = 2,
+        retry_backoff_seconds: float = 0.5,
     ) -> None:
         self.log = get_logger("integrations.alpaca")
         if not paper:
@@ -93,6 +96,8 @@ class AlpacaPaperClient(BaseBroker):
             s.upper() for s in (enabled_symbols or [])
         }
         self._http = http_client or httpx.Client(timeout=timeout_seconds)
+        self._max_retries = max(0, int(max_retries))
+        self._retry_backoff = float(retry_backoff_seconds)
         self._headers_cache = {
             "APCA-API-KEY-ID": self._api_key,
             "APCA-API-SECRET-KEY": self._secret_key,
@@ -105,10 +110,40 @@ class AlpacaPaperClient(BaseBroker):
     def _headers(self) -> dict[str, str]:
         return dict(self._headers_cache)
 
+    def _with_retry(self, label: str, fn):  # noqa: ANN001, ANN202
+        """Retry transient network errors (TLS/connect/read timeouts, DNS).
+
+        A single flaky handshake shouldn't fail the pre-trade reconcile and
+        block the whole scan cycle. HTTP status errors (4xx/5xx) are NOT
+        retried here — only ``httpx.HTTPError`` transport failures.
+        """
+        last: Optional[Exception] = None
+        for attempt in range(self._max_retries + 1):
+            try:
+                return fn()
+            except httpx.HTTPError as e:
+                last = e
+                if attempt < self._max_retries:
+                    self.log.warning(
+                        "alpaca.net_retry",
+                        op=label,
+                        attempt=attempt + 1,
+                        max=self._max_retries,
+                        error=str(e),
+                    )
+                    time.sleep(self._retry_backoff * (attempt + 1))
+                    continue
+                raise
+        assert last is not None  # pragma: no cover
+        raise last
+
     def _get(self, path: str, *, params: Optional[dict[str, Any]] = None, base: Optional[str] = None) -> Any:
         url = f"{base or self.base_url}/{path.lstrip('/')}"
         try:
-            resp = self._http.get(url, headers=self._headers(), params=params)
+            resp = self._with_retry(
+                f"GET {path}",
+                lambda: self._http.get(url, headers=self._headers(), params=params),
+            )
         except httpx.HTTPError as e:
             raise BrokerError(f"Alpaca GET {path} network error: {e}") from e
         if resp.status_code >= 400:
@@ -121,19 +156,33 @@ class AlpacaPaperClient(BaseBroker):
         url = f"{self.base_url}/{path.lstrip('/')}"
         safe_body = redact_secrets(body)
         try:
-            resp = self._http.post(url, headers=self._headers(), json=body)
+            resp = self._with_retry(
+                f"POST {path}",
+                lambda: self._http.post(url, headers=self._headers(), json=body),
+            )
         except httpx.HTTPError as e:
             self.log.error("alpaca.post_failed", path=path, body=safe_body, error=str(e))
             raise BrokerError(f"Alpaca POST {path} network error: {e}") from e
         if resp.status_code >= 400:
+            # Alpaca returns a JSON body like {"code": ..., "message": "..."}
+            # explaining the rejection. Surface it so the log + Discord alert
+            # say *why* (e.g. wash trade, fractional+bracket, not shortable).
+            detail = ""
+            try:
+                err = resp.json()
+                detail = err.get("message") if isinstance(err, dict) else str(err)
+            except Exception:  # noqa: BLE001
+                detail = (resp.text or "").strip()[:300]
             self.log.error(
                 "alpaca.post_status",
                 path=path,
                 body=safe_body,
                 status=resp.status_code,
+                detail=detail,
             )
+            suffix = f": {detail}" if detail else ""
             raise BrokerError(
-                f"Alpaca POST {path} failed status={resp.status_code}"
+                f"Alpaca POST {path} failed status={resp.status_code}{suffix}"
             )
         data = resp.json()
         self.log.info(
@@ -224,6 +273,62 @@ class AlpacaPaperClient(BaseBroker):
                     )
                 )
         return result
+
+    def get_last_exit_fill(
+        self, *, symbol: str, exit_side: OrderSide
+    ) -> Optional[ExitFill]:
+        """Find the most recent filled *closing* order for ``symbol``.
+
+        When a bracket's take-profit or stop-loss fills, that leg becomes a
+        closed order on the ``exit_side`` (opposite the entry). We pull the
+        recent closed orders (parents + nested legs) and return the newest
+        filled one on that side so the loop can compute realised P&L.
+        """
+        sym = symbol.upper()
+        try:
+            rows = self._get(
+                "/v2/orders",
+                params={
+                    "status": "closed",
+                    "symbols": sym,
+                    "limit": 50,
+                    "direction": "desc",
+                    "nested": "true",
+                },
+            )
+        except BrokerError as e:
+            self.log.warning("alpaca.exit_fill_lookup_failed", symbol=sym, error=str(e))
+            return None
+        if not isinstance(rows, list):
+            return None
+
+        for parent in rows:
+            if not isinstance(parent, dict):
+                continue
+            # A bracket parent nests its take-profit / stop-loss legs.
+            candidates = [parent, *(parent.get("legs") or [])]
+            for order in candidates:
+                if not isinstance(order, dict):
+                    continue
+                if str(order.get("symbol", "")).upper() != sym:
+                    continue
+                if str(order.get("side", "")).lower() != exit_side:
+                    continue
+                if str(order.get("status", "")).lower() != "filled":
+                    continue
+                fill_price = _maybe_float(order.get("filled_avg_price"))
+                if fill_price is None:
+                    continue
+                fill_qty = _maybe_float(order.get("filled_qty")) or 0.0
+                return ExitFill(
+                    symbol=sym,
+                    price=fill_price,
+                    quantity=abs(fill_qty),
+                    side=exit_side,
+                    exit_kind=_exit_kind_from_order(order),
+                    filled_at=str(order.get("filled_at", "") or ""),
+                )
+        return None
 
     def get_latest_quote(self, symbol: str) -> Quote:
         self._refuse_if_futures(symbol)
@@ -420,12 +525,18 @@ class AlpacaPaperClient(BaseBroker):
             target_price = (
                 entry_price + 2 * risk if side == "buy" else entry_price - 2 * risk
             )
+        # Bracket orders (and short sales) do NOT support fractional shares.
+        # Sending a float like 67.0 can route into Alpaca's fractional path
+        # and 422. Send a whole-share integer; equity sizing already floors.
+        qty_f = float(qty)
+        qty_val: Any = int(qty_f) if qty_f.is_integer() else qty_f
+        # Equity prices must be penny-aligned (<= 2 decimals) or Alpaca 422s.
         body: dict[str, Any] = {
             "symbol": symbol.upper(),
-            "qty": float(qty),
+            "qty": qty_val,
             "side": side,
             "type": "limit",
-            "limit_price": float(entry_price),
+            "limit_price": round(float(entry_price), 2),
             "time_in_force": time_in_force,
             "order_class": "bracket",
             "take_profit": {"limit_price": round(float(target_price), 2)},
@@ -531,6 +642,21 @@ def _map_order_type(raw: Any) -> str:
     if "limit" in s:
         return "limit"
     return "market"
+
+
+def _exit_kind_from_order(order: dict[str, Any]) -> str:
+    """Infer why a position closed from the closing order's type.
+
+    A take-profit leg is a ``limit`` order; a stop-loss leg is a ``stop``
+    (or ``stop_limit``); anything else (e.g. a market close on flatten)
+    is a plain ``closed``.
+    """
+    t = str(order.get("type", "") or order.get("order_type", "")).lower()
+    if "stop" in t:
+        return "stop_loss"
+    if "limit" in t:
+        return "take_profit"
+    return "closed"
 
 
 def _map_status(raw: Any) -> str:

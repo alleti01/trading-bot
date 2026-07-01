@@ -103,24 +103,30 @@ def execute_entry_with_stops(
             target_price=target_price,
         )
     except BrokerError as e:
-        _block_entries(ctx, reason=f"bracket_failed: {e}")
+        # A per-order rejection (e.g. Alpaca 422) is specific to this symbol,
+        # not a systemic broker outage — skip this name and keep scanning the
+        # rest of the universe rather than halting all entries for the cycle.
+        # (Systemic failures are blocked separately in reconcile / build.)
+        _log.warning("workflow.bracket_rejected", symbol=symbol, error=str(e))
         ctx.notifier.notify(
             "system.error",
             source="workflow.order_execution",
             symbol=symbol,
             error=str(e),
-            detail="Bracket order failed — blocking new entries",
+            detail="Bracket order rejected — skipping this symbol",
         )
         return False, None, None
 
     if not entry.success:
-        _block_entries(ctx, reason=f"entry_rejected: {entry.reason}")
+        _log.warning(
+            "workflow.entry_rejected", symbol=symbol, reason=entry.reason
+        )
         ctx.notifier.notify(
             "system.error",
             source="workflow.order_execution",
             symbol=symbol,
             error=entry.reason or "entry rejected",
-            detail="Bracket entry rejected — blocking new entries",
+            detail="Bracket entry rejected — skipping this symbol",
         )
         return False, entry, None
 

@@ -64,6 +64,22 @@ class Quote:
 
 
 @dataclass(frozen=True)
+class ExitFill:
+    """The fill that closed a position.
+
+    ``exit_kind`` records *why* the position closed based on the closing
+    order type: a take-profit limit, a protective stop, or a plain close.
+    """
+
+    symbol: str
+    price: float
+    quantity: float
+    side: OrderSide
+    exit_kind: Literal["take_profit", "stop_loss", "closed"] = "closed"
+    filled_at: str = ""
+
+
+@dataclass(frozen=True)
 class OrderResult:
     """Structured response returned by every order method.
 
@@ -211,6 +227,18 @@ class BaseBroker(ABC):
             limit_price=entry_price,
             time_in_force=time_in_force,
         )
+
+    def get_last_exit_fill(
+        self, *, symbol: str, exit_side: OrderSide
+    ) -> Optional[ExitFill]:
+        """Most recent *closing* fill for ``symbol`` on ``exit_side``.
+
+        Used to report realised P&L after a bracket's take-profit/stop-loss
+        fills server-side (so the loop never saw the close itself). Adapters
+        that can't look up historical fills return ``None`` and the caller
+        degrades to a close alert without a dollar figure.
+        """
+        return None
 
     def reconcile(self) -> dict[str, Any]:
         """Pull positions/orders before placing new orders."""

@@ -26,6 +26,7 @@ def _client(http: MagicMock, **overrides) -> AlpacaPaperClient:
         paper=True,
         enabled_symbols=["AAPL", "MSFT"],
         http_client=http,
+        max_retries=0,  # deterministic + fast; retry path tested separately
     )
     base.update(overrides)
     return AlpacaPaperClient(**base)
@@ -178,6 +179,35 @@ def test_broker_failure_surfaces_after_network_error() -> None:
     client = _client(http)
     with pytest.raises(BrokerError):
         client.get_positions()
+
+
+def test_transient_network_error_is_retried_then_succeeds(monkeypatch) -> None:
+    # First call fails with a TLS/handshake-style error, retry succeeds —
+    # the reconcile should not blow up on a single transient blip.
+    import integrations.alpaca_paper_client as mod
+
+    monkeypatch.setattr(mod.time, "sleep", lambda *_a, **_k: None)
+    http = MagicMock()
+    http.get.side_effect = [
+        httpx.ConnectError("_ssl.c:999: handshake timed out"),
+        _stub_response(200, []),
+    ]
+    client = _client(http, max_retries=2)
+    positions = client.get_positions()
+    assert positions == []
+    assert http.get.call_count == 2  # failed once, retried once
+
+
+def test_persistent_network_error_raises_after_retries(monkeypatch) -> None:
+    import integrations.alpaca_paper_client as mod
+
+    monkeypatch.setattr(mod.time, "sleep", lambda *_a, **_k: None)
+    http = MagicMock()
+    http.get.side_effect = httpx.ConnectError("down")
+    client = _client(http, max_retries=2)
+    with pytest.raises(BrokerError):
+        client.get_positions()
+    assert http.get.call_count == 3  # initial + 2 retries
 
 
 def test_trailing_stop_requires_percent_kind() -> None:

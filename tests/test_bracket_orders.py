@@ -69,6 +69,47 @@ def test_alpaca_bracket_order_payload_has_legs() -> None:
     assert body["stop_loss"]["stop_price"] == 545.0
 
 
+def test_alpaca_bracket_sends_integer_qty_and_penny_prices() -> None:
+    # Whole-share qty must serialize as an int (67, not 67.0) so Alpaca
+    # doesn't route it into the fractional path (which 422s with brackets),
+    # and prices must be penny-rounded.
+    http = MagicMock()
+    http.post.return_value = _stub_response(200, {"id": "br-x", "status": "accepted"})
+    client = AlpacaPaperClient(
+        api_key="k", secret_key="s", base_url=_PAPER_URL, paper=True,
+        enabled_symbols=["MSFT"], http_client=http,
+    )
+    client.place_bracket_order(
+        symbol="MSFT", qty=67.0, side="sell",
+        entry_price=372.51, stop_price=373.0688, target_price=371.3925,
+    )
+    body = http.post.call_args.kwargs["json"]
+    assert body["qty"] == 67
+    assert isinstance(body["qty"], int)
+    assert body["limit_price"] == 372.51
+    assert body["stop_loss"]["stop_price"] == 373.07
+    assert body["take_profit"]["limit_price"] == 371.39
+
+
+def test_alpaca_surfaces_error_message_on_rejection() -> None:
+    # A 422 with a JSON message must propagate the reason, not a bare status.
+    from integrations.broker_base import BrokerError
+
+    http = MagicMock()
+    http.post.return_value = _stub_response(
+        422, {"code": 40010001, "message": "potential wash trade detected"}
+    )
+    client = AlpacaPaperClient(
+        api_key="k", secret_key="s", base_url=_PAPER_URL, paper=True,
+        enabled_symbols=["MSFT"], http_client=http,
+    )
+    with pytest.raises(BrokerError, match="potential wash trade detected"):
+        client.place_bracket_order(
+            symbol="MSFT", qty=1, side="sell",
+            entry_price=372.51, stop_price=373.07, target_price=371.39,
+        )
+
+
 def test_alpaca_bracket_synthesizes_target_when_missing() -> None:
     http = MagicMock()
     http.post.return_value = _stub_response(200, {"id": "br-2", "status": "accepted"})

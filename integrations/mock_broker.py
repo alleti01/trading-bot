@@ -10,6 +10,7 @@ from app.logging_config import get_logger
 from integrations.broker_base import (
     AccountState,
     BaseBroker,
+    ExitFill,
     OpenOrder,
     OrderResult,
     OrderSide,
@@ -65,6 +66,7 @@ class MockBroker(BaseBroker):
         self._quotes: dict[str, float] = {**_DEFAULT_QUOTES, **(seed_quotes or {})}
         self._positions: dict[str, PositionState] = {}
         self._open_orders: dict[str, OpenOrder] = {}
+        self._last_exit_fills: dict[str, ExitFill] = {}
         self._account_id = "MOCK-DEMO-1"
 
     # ----------------------- account state ----------------------------
@@ -242,6 +244,15 @@ class MockBroker(BaseBroker):
                 reason="no_position",
             )
         side: OrderSide = "sell" if pos.direction == "long" else "buy"
+        fill_price = self._quotes.get(sym)
+        if fill_price is not None:
+            self._last_exit_fills[sym] = ExitFill(
+                symbol=sym,
+                price=float(fill_price),
+                quantity=abs(pos.quantity),
+                side=side,
+                exit_kind="closed",
+            )
         return OrderResult(
             success=True,
             simulated=True,
@@ -251,9 +262,17 @@ class MockBroker(BaseBroker):
             quantity=abs(pos.quantity),
             order_type="market",
             status="filled",
-            fill_price=self._quotes.get(sym),
+            fill_price=fill_price,
             reason="close_position",
         )
+
+    def get_last_exit_fill(
+        self, *, symbol: str, exit_side: OrderSide
+    ) -> Optional[ExitFill]:
+        fill = self._last_exit_fills.get(symbol.upper())
+        if fill is not None and fill.side == exit_side:
+            return fill
+        return None
 
     def cancel_order(self, *, order_id: str) -> OrderResult:
         existing = self._open_orders.pop(order_id, None)

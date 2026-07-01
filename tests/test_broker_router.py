@@ -39,6 +39,29 @@ def test_router_selects_mock(monkeypatch: pytest.MonkeyPatch) -> None:
     assert isinstance(broker, MockBroker)
 
 
+def test_dynamic_universe_broker_accepts_allowlist_symbols(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With the dynamic universe on, the broker must accept vetted allowlist
+    # names (e.g. NVDA) even though only AAPL is in ENABLED_SYMBOLS — otherwise
+    # the loop scans them but every order is rejected as "not enabled".
+    settings = _settings(monkeypatch, WORKFLOW_DYNAMIC_UNIVERSE="true")
+    broker = build_broker(settings)
+    assert "NVDA" in broker.enabled_symbols
+    assert "AMD" in broker.enabled_symbols
+    assert broker.validate_order(symbol="NVDA", qty=1, side="buy").valid
+
+
+def test_static_universe_broker_gates_to_enabled_symbols(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Dynamic universe off → only ENABLED_SYMBOLS are tradable (unchanged).
+    settings = _settings(monkeypatch, WORKFLOW_DYNAMIC_UNIVERSE="false")
+    broker = build_broker(settings)
+    assert "NVDA" not in broker.enabled_symbols
+    assert not broker.validate_order(symbol="NVDA", qty=1, side="buy").valid
+
+
 def test_router_selects_alpaca(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _settings(
         monkeypatch,

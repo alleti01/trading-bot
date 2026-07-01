@@ -26,6 +26,8 @@ data/*.db-journal
 data/historical/
 data/models/
 data/reports/
+data/live/
+data/options/
 logs/
 
 # --- OS / editors ---
